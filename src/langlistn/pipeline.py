@@ -19,6 +19,7 @@ import logging
 import math
 import signal
 import sys
+import termios
 import threading
 import time
 from collections import Counter
@@ -128,13 +129,31 @@ def _is_hallucination(text: str) -> bool:
 
 
 
+def _read_single_key() -> str:
+    """Read a single keypress without waiting for Enter."""
+    import tty
+    import termios
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    return ch
+
+
 def _offer_transcript_save(text: str, start_time: float):
     """Prompt user to save transcript to Desktop."""
     try:
-        ans = input("Save transcript? [Y/n] ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
+        sys.stdout.write("Save transcript? [Y/n] ")
+        sys.stdout.flush()
+        ch = _read_single_key().lower()
+        sys.stdout.write(ch + "\n")
+    except (EOFError, KeyboardInterrupt, OSError):
+        sys.stdout.write("\n")
         return
-    if ans in ("", "y", "yes"):
+    if ch in ("y", "\r", "\n"):
         ts = time.strftime("%Y%m%d-%H%M%S", time.localtime(start_time))
         path = Path.home() / "Desktop" / f"langlistn-{ts}.txt"
         path.write_text(text, encoding="utf-8")
