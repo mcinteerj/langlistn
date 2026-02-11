@@ -341,6 +341,22 @@ def _interactive_setup() -> dict:
         "translate_model": translate_model,
     })
 
+    # Print equivalent command for future use
+    cmd_parts = ["langlistn"]
+    if app_name:
+        cmd_parts.append(f'--app "{app_name}"')
+    elif mic:
+        cmd_parts.append("--mic")
+    if device:
+        cmd_parts.append(f'--device "{device}"')
+    if lang:
+        cmd_parts.append(f"--source {lang}")
+    if no_translate:
+        cmd_parts.append("--no-translate")
+    elif translate_model and translate_model != "haiku":
+        cmd_parts.append(f"--translate-model {translate_model}")
+    print(f"\n  💡 Next time, run directly:\n     {' '.join(cmd_parts)}\n")
+
     return result
 
 

@@ -6,6 +6,19 @@ Local Whisper transcription + cloud translation via AWS Bedrock Claude for natur
 
 > **macOS 15+** · **Apple Silicon (M1+)** · **Python 3.11+** · **AWS account** (for translation)
 
+## 30-second start
+
+```bash
+git clone https://github.com/mcinteerj/langlistn.git
+cd langlistn
+python3 -m venv .venv && .venv/bin/pip install .
+bash swift/build.sh
+aws sso login                          # or however you auth to AWS
+langlistn                              # interactive setup walks you through it
+```
+
+> First run downloads the Whisper model (~3GB). Grant your terminal **Screen & System Audio Recording** permissions in System Settings → Privacy & Security and restart it.
+
 ## How it works
 
 ```
@@ -30,7 +43,7 @@ Two-zone terminal (bold = confirmed, dim italic = speculative)
 │                                                  │
 │  Audio chunks                                    │
 │    → Silero VAD (discard non-speech)             │
-│    → mlx-whisper transcribe (25s buffer)         │
+│    → mlx-whisper transcribe (18s buffer)         │
 │      init_prompt = prior confirmed text          │
 │    → LocalAgreement-2 → confirmed source         │
 │    → stash last 3 speculative hypotheses         │
@@ -40,7 +53,7 @@ Two-zone terminal (bold = confirmed, dim italic = speculative)
 └──────────────┬───────────────────────────────────┘
                ↓
 ┌──────────────────────────────────────────────────┐
-│  TRANSLATION LOOP (on every whisper cycle)       │
+│  TRANSLATION LOOP (parallel, event-driven)       │
 │                                                  │
 │  Prompt to Claude:                               │
 │    "Korean transcript: {full_source}"            │
@@ -60,9 +73,9 @@ Two-zone terminal (bold = confirmed, dim italic = speculative)
         bold = locked, dim italic = live tail
 ```
 
-Audio is captured per-app via ScreenCaptureKit. Non-speech audio (music, silence) is filtered by Silero VAD before reaching Whisper. Whisper transcribes in the source language using a growing buffer with LocalAgreement-2 — text is confirmed only when two consecutive runs agree. The full source transcript and confirmed English are sent to Claude, which produces an updated translation. Translation is confirmed by diffing consecutive LLM outputs — stable prefixes are locked and fed back as context.
+Audio is captured per-app via ScreenCaptureKit. Non-speech audio (music, silence) is filtered by Silero VAD before reaching Whisper. Whisper transcribes in the source language using a growing buffer with LocalAgreement-2 — text is confirmed only when two consecutive runs agree. Transcription and translation run as parallel async loops — whisper updates the display immediately, while Claude translates independently using the latest source text. Translation is confirmed by diffing consecutive LLM outputs — stable prefixes are locked and fed back as context. Streaming LLM responses provide incremental display updates as tokens arrive.
 
-## Quick start
+## Install
 
 ```bash
 git clone https://github.com/mcinteerj/langlistn.git
@@ -82,19 +95,7 @@ Translation requires AWS credentials with Bedrock access:
 aws sso login    # or configure credentials however you prefer
 ```
 
-Your AWS profile needs access to Bedrock Claude models in your configured region.
-
-### Run
-
-```bash
-# Interactive setup — choose app, language, model
-langlistn
-
-# Or direct
-langlistn --app "Google Chrome" --source ko
-```
-
-First run downloads the Whisper model (~3GB). Subsequent runs start in a few seconds.
+Your AWS profile needs access to Bedrock Claude models in your configured region. First run downloads the Whisper model (~3GB).
 
 ## Usage
 
@@ -213,7 +214,7 @@ langlistn --list-devices    # Show audio input devices
 - **Two-zone confirmation**: Translation is confirmed by diffing recent LLM outputs. Stable prefixes lock at word boundaries. Force-confirm after 3 unstable cycles prevents text from staying speculative forever.
 - **Ring buffer comparison**: Compares current LLM output against the last 4 outputs, not just the previous one. If outputs 1 and 3 agree (even though 2 differed), confirmation still fires.
 - **Multi-hypothesis translation**: Recent whisper speculative outputs (which may differ across runs) are fed to Claude as alternatives, helping disambiguate homophones and boundary-ambiguous words.
-- **25s audio buffer**: Whisper always processes a 30s spectrogram internally (shorter audio is zero-padded). Keeping 25s in the buffer maximises context for CJK languages where word boundaries are ambiguous.
+- **18s audio buffer**: Whisper always processes a 30s spectrogram internally (shorter audio is zero-padded). 18s balances context for CJK languages (where word boundaries are ambiguous) against inference speed.
 
 ### Project structure
 
