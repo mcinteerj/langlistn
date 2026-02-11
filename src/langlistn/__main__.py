@@ -28,58 +28,77 @@ from dotenv import load_dotenv
 from . import __version__
 
 _CONFIG_DIR = Path.home() / ".config" / "langlistn"
-_LAST_SESSION = _CONFIG_DIR / "last.json"
+_RECENT_FILE = _CONFIG_DIR / "recent.json"
+_MAX_RECENT = 5
 
 
-def _load_last_session() -> dict:
+def _load_recent() -> list[dict]:
+    """Load recent session configs (newest first)."""
     try:
-        return json.loads(_LAST_SESSION.read_text())
+        data = json.loads(_RECENT_FILE.read_text())
+        if isinstance(data, list):
+            return data[:_MAX_RECENT]
+        # Migrate from old single-session format
+        if isinstance(data, dict) and (data.get("app") or data.get("mic")):
+            return [data]
     except Exception:
-        return {}
+        pass
+    # Migrate from old last.json if it exists
+    old = _CONFIG_DIR / "last.json"
+    try:
+        data = json.loads(old.read_text())
+        if isinstance(data, dict) and (data.get("app") or data.get("mic")):
+            return [data]
+    except Exception:
+        pass
+    return []
 
 
-def _save_last_session(data: dict):
+def _save_recent(entry: dict):
+    """Save a session config, deduplicating and keeping most recent 5."""
+    recent = _load_recent()
+    # Deduplicate: remove any existing entry with same app/mic/lang/model
+    key = (entry.get("app"), entry.get("mic"), entry.get("lang"), entry.get("translate_model"))
+    recent = [r for r in recent if (r.get("app"), r.get("mic"), r.get("lang"), r.get("translate_model")) != key]
+    recent.insert(0, entry)
+    recent = recent[:_MAX_RECENT]
     try:
         _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        _LAST_SESSION.write_text(json.dumps(data))
+        _RECENT_FILE.write_text(json.dumps(recent))
     except Exception:
         pass
 
 
-def _quick_rerun_prompt(last: dict) -> bool | None:
-    """Show last-session prompt. Returns True=reuse, False=wizard, None=no last."""
-    app = last.get("app")
-    mic = last.get("mic")
-    if not app and not mic:
-        return None
-    source = app or "microphone"
-    lang = last.get("lang") or "auto"
-    t_model = last.get("translate_model") or "transcribe-only"
-    label = f"{source} / {lang} / {t_model}"
+def _session_label(cfg: dict) -> str:
+    """Human-readable label for a session config."""
+    source = cfg.get("app") or ("microphone" if cfg.get("mic") else "?")
+    lang = cfg.get("lang") or "auto"
+    t_model = cfg.get("translate_model") or "transcribe-only"
+    return f"{source} / {lang} / {t_model}"
 
-    sys.stdout.write(f"\n  Last: {label}\n")
-    sys.stdout.write("  Enter to reuse, any key for setup: ")
-    sys.stdout.flush()
 
-    fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
-    try:
-        tty.setraw(fd)
-        ready, _, _ = select.select([fd], [], [], 10.0)
-        if ready:
-            ch = sys.stdin.read(1)
-            sys.stdout.write("\n")
-            if ch in ("\r", "\n"):
-                return True
-            if ch == "\x03":  # Ctrl+C
-                raise KeyboardInterrupt
-            return False
-        else:
-            # Timeout — reuse
-            sys.stdout.write("\n")
-            return True
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+def _pick_recent_or_new(recent: list[dict]) -> dict | None:
+    """Show recent configs + new option. Returns config dict or None for new setup."""
+    print("\n🎧 langlistn — real-time audio translation\n")
+    print("  Recent:")
+    for i, cfg in enumerate(recent):
+        print(f"    [{i + 1}] {_session_label(cfg)}")
+    print(f"    [n] New configuration\n")
+
+    while True:
+        try:
+            raw = input("  Choice [1]: ").strip().lower()
+            if not raw:
+                return recent[0]
+            if raw == "n":
+                return None
+            idx = int(raw) - 1
+            if 0 <= idx < len(recent):
+                return recent[idx]
+        except (ValueError, EOFError):
+            pass
+        except KeyboardInterrupt:
+            raise
 
 
 def _pick(prompt: str, options: list[str], default: int = 0) -> str:
@@ -103,8 +122,8 @@ def _pick(prompt: str, options: list[str], default: int = 0) -> str:
 
 def _pick_app_simple(apps: list[str]) -> str:
     """Fallback app picker for non-interactive terminals."""
-    last = _load_last_session()
-    last_app = last.get("app")
+    recent = _load_recent()
+    last_app = recent[0].get("app") if recent else None
     if last_app and last_app in apps:
         apps = [last_app] + [a for a in apps if a != last_app]
 
@@ -128,8 +147,8 @@ def _pick_app_simple(apps: list[str]) -> str:
 
 def _pick_app(apps: list[str]) -> str:
     """Type-to-filter app picker with raw-mode keystrokes and last-used memory."""
-    last = _load_last_session()
-    last_app = last.get("app")
+    recent = _load_recent()
+    last_app = recent[0].get("app") if recent else None
 
     if last_app and last_app in apps:
         apps = [last_app] + [a for a in apps if a != last_app]
@@ -292,7 +311,8 @@ def _interactive_setup() -> dict:
                 device = devices[idx]["name"]
 
     # 2. Source language (default from last session)
-    last = _load_last_session()
+    recent = _load_recent()
+    last = recent[0] if recent else {}
     lang_options = ["Auto-detect"] + [
         f"{code} — {name}" for code, name in sorted(LANGUAGE_MAP.items())
     ]
@@ -333,7 +353,7 @@ def _interactive_setup() -> dict:
     }
 
     # Remember for next time
-    _save_last_session({
+    _save_recent({
         "app": app_name,
         "mic": mic,
         "device": device,
@@ -433,17 +453,19 @@ examples:
     # Interactive mode if no source specified
     if not args.app and not args.mic:
         try:
-            last = _load_last_session()
-            if last.get("app") or last.get("mic"):
-                reuse = _quick_rerun_prompt(last)
-                if reuse:
+            recent = _load_recent()
+            if recent:
+                chosen = _pick_recent_or_new(recent)
+                if chosen is not None:
+                    # Re-save to bump to top of recent list
+                    _save_recent(chosen)
                     kwargs = {
-                        "app_name": last.get("app"),
-                        "mic": last.get("mic", False),
-                        "device": last.get("device"),
-                        "lang": last.get("lang"),
-                        "translate_model": last.get("translate_model"),
-                        "no_translate": last.get("translate_model") is None,
+                        "app_name": chosen.get("app"),
+                        "mic": chosen.get("mic", False),
+                        "device": chosen.get("device"),
+                        "lang": chosen.get("lang"),
+                        "translate_model": chosen.get("translate_model"),
+                        "no_translate": chosen.get("translate_model") is None,
                     }
                 else:
                     kwargs = _interactive_setup()
