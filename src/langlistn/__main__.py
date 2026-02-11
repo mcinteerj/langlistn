@@ -99,60 +99,141 @@ def _pick(prompt: str, options: list[str], default: int = 0) -> str:
         print(f"  Enter 1-{len(options)}")
 
 
-def _pick_app(apps: list[str]) -> str:
-    """Type-to-filter app picker with last-used memory."""
+def _pick_app_simple(apps: list[str]) -> str:
+    """Fallback app picker for non-interactive terminals."""
     last = _load_last_session()
     last_app = last.get("app")
-
-    # Reorder: last-used first if still available
     if last_app and last_app in apps:
         apps = [last_app] + [a for a in apps if a != last_app]
 
-    print("\n  Choose app (type to filter, Enter to select):")
-    filtered = apps
-    query = ""
-
+    print("\n  Choose app:")
+    for i, app in enumerate(apps[:15]):
+        tag = " (last)" if app == last_app else ""
+        print(f"    [{i + 1}] {app}{tag}")
+    if len(apps) > 15:
+        print(f"    ... {len(apps) - 15} more")
     while True:
-        # Show current matches
-        shown = filtered[:15]
-        if not query:
-            print()
-            for i, app in enumerate(shown):
-                tag = " (last used)" if app == last_app else ""
-                marker = "→" if i == 0 else " "
-                print(f"  {marker} [{i + 1}] {app}{tag}")
-            if len(filtered) > 15:
-                print(f"    ... {len(filtered) - 15} more — type to filter")
-        else:
-            print()
-            for i, app in enumerate(shown):
-                print(f"    [{i + 1}] {app}")
-            if not shown:
-                print("    No matches")
-
         try:
-            raw = input(f"\n  Filter/select [{query}]: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            raise KeyboardInterrupt
-
-        if not raw:
-            if filtered:
-                return filtered[0]
-            continue
-
-        # Number = direct selection
-        try:
+            raw = input("\n  Choice [1]: ").strip()
+            if not raw:
+                return apps[0]
             idx = int(raw) - 1
-            if 0 <= idx < len(shown):
-                return shown[idx]
-        except ValueError:
+            if 0 <= idx < len(apps):
+                return apps[idx]
+        except (ValueError, EOFError):
             pass
 
-        # Text = update filter
-        query = raw.lower()
-        filtered = [a for a in apps if query in a.lower()]
-        if len(filtered) == 1:
-            return filtered[0]
+
+def _pick_app(apps: list[str]) -> str:
+    """Type-to-filter app picker with raw-mode keystrokes and last-used memory."""
+    last = _load_last_session()
+    last_app = last.get("app")
+
+    if last_app and last_app in apps:
+        apps = [last_app] + [a for a in apps if a != last_app]
+
+    # Guard: fall back for non-interactive stdin
+    try:
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+    except (OSError, termios.error):
+        return _pick_app_simple(apps)
+
+    query = ""
+    filtered = apps
+    MAX_VISIBLE = 10
+    selected_idx = 0
+
+    MOVE_UP = "\033[A"
+    CLEAR_LINE = "\033[2K"
+
+    def _draw(lines_to_erase: int) -> int:
+        for _ in range(lines_to_erase):
+            sys.stdout.write(f"{MOVE_UP}{CLEAR_LINE}\r")
+
+        shown = filtered[:MAX_VISIBLE]
+        lines = 0
+
+        for i, app in enumerate(shown):
+            marker = "→" if i == selected_idx else " "
+            tag = " (last)" if app == last_app and not query else ""
+            sys.stdout.write(f"  {marker} [{i + 1}] {app}{tag}\n")
+            lines += 1
+
+        if not shown:
+            sys.stdout.write("    No matches\n")
+            lines += 1
+
+        if len(filtered) > MAX_VISIBLE:
+            sys.stdout.write(f"    ... {len(filtered) - MAX_VISIBLE} more\n")
+            lines += 1
+
+        sys.stdout.write(f"  Filter: {query}█")
+        sys.stdout.flush()
+        lines += 1
+        return lines
+
+    try:
+        sys.stdout.write("\n  Choose app (type to filter, Enter to select):\n")
+        drawn = _draw(0)
+
+        tty.setraw(fd)
+        while True:
+            ch = sys.stdin.read(1)
+
+            if ch in ('\r', '\n'):
+                break
+            elif ch == '\x03':
+                raise KeyboardInterrupt
+            elif ch in ('\x7f', '\x08'):
+                query = query[:-1]
+            elif ch == '\x1b':
+                seq = sys.stdin.read(2)
+                if seq == '[A':
+                    selected_idx = max(0, selected_idx - 1)
+                elif seq == '[B':
+                    selected_idx = min(len(filtered[:MAX_VISIBLE]) - 1, selected_idx + 1)
+                # Restore cooked briefly to redraw
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                drawn = _draw(drawn)
+                tty.setraw(fd)
+                continue
+            elif ch.isprintable():
+                query += ch
+            else:
+                continue
+
+            filtered = [a for a in apps if query.lower() in a.lower()] if query else apps
+            selected_idx = 0
+
+            # Restore cooked briefly to redraw
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            if len(filtered) == 1:
+                # Auto-select single match — erase and break
+                for _ in range(drawn):
+                    sys.stdout.write(f"{MOVE_UP}{CLEAR_LINE}\r")
+                sys.stdout.flush()
+                choice = filtered[0]
+                sys.stdout.write(f"  ✓ {choice}\n")
+                sys.stdout.flush()
+                return choice
+            drawn = _draw(drawn)
+            tty.setraw(fd)
+
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        # Clean exit: erase picker
+        for _ in range(drawn):
+            sys.stdout.write(f"{MOVE_UP}{CLEAR_LINE}\r")
+        sys.stdout.flush()
+
+    if filtered:
+        choice = filtered[min(selected_idx, len(filtered) - 1)]
+        sys.stdout.write(f"  ✓ {choice}\n")
+        sys.stdout.flush()
+        return choice
+
+    return apps[0]
 
 
 def _interactive_setup() -> dict:

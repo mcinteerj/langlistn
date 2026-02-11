@@ -1,217 +1,252 @@
-# Group B: Status Bar + Silence Feedback + Speaker Colours
+# PLAN — Group C: Loading Spinner + Cleaner App Picker
 
-Branch: `ux/status` · Worktree: `langlistn-ux-status`
+## 1. Loading Spinner (`display.py` + `pipeline.py`)
+
+### display.py — New `Spinner` class
+
+```python
+class Spinner:
+    """Animated braille spinner with elapsed time. Thread-safe start/stop."""
+
+    FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    INTERVAL = 0.1  # 100ms
+
+    def __init__(self, message: str, hint: str = ""):
+        # message: e.g. "loading whisper-large-v2-mlx + VAD"
+        # hint: e.g. "(downloading model ~3GB)" — shown on first run only
+        self._message = message
+        self._hint = hint
+        self._task: asyncio.Task | None = None
+        self._start_time: float = 0
+
+    async def start(self):
+        """Call from async context. Spawns display task."""
+        self._start_time = time.time()
+        self._task = asyncio.create_task(self._animate())
+
+    async def _animate(self):
+        idx = 0
+        try:
+            while True:
+                elapsed = time.time() - self._start_time
+                frame = self.FRAMES[idx % len(self.FRAMES)]
+                parts = f"  {frame} {self._message} ({elapsed:.1f}s)"
+                if self._hint:
+                    parts += f"  {DIM}{self._hint}{RESET}"
+                sys.stdout.write(f"\r{CLEAR_LINE}{parts}")
+                sys.stdout.flush()
+                idx += 1
+                await asyncio.sleep(self.INTERVAL)
+        except asyncio.CancelledError:
+            # Final line: replace spinner with ✓
+            elapsed = time.time() - self._start_time
+            sys.stdout.write(f"\r{CLEAR_LINE}  ✓ {self._message} ({elapsed:.1f}s)\n")
+            sys.stdout.flush()
+
+    async def stop(self):
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+```
+
+**Imports needed in display.py:** `asyncio`, `time`
+
+### pipeline.py — Use Spinner during model load
+
+Replace the static `display.update("", "", loading_msg + "...")` block (lines ~184-204) with:
+
+```python
+# Detect first-run: check if model files exist locally
+from .config import recommend_model
+import huggingface_hub
+model_id = model_name  # e.g. "mlx-community/whisper-large-v2-mlx"
+hint = ""
+try:
+    # If snapshot_download would need to fetch, it's a first run
+    local_path = huggingface_hub.try_to_load_from_cache(model_id, "config.json")
+    if local_path is None:
+        hint = "(downloading model ~3GB — first run only)"
+except Exception:
+    pass
+
+loading_msg = f"loading {model_name} + VAD"
+if speaker_tracker:
+    loading_msg += " + diarization"
+
+spinner = Spinner(loading_msg, hint=hint)
+await spinner.start()
+
+# ... existing threading.Thread load logic stays the same ...
+
+await load_done.wait()
+await spinner.stop()
+
+if load_error:
+    sys.stderr.write(f"\nModel load failed: {load_error}\n")
+    return
+```
+
+**Import:** `from .display import Spinner`
+
+### First-run detection detail
+
+Use `huggingface_hub.try_to_load_from_cache(repo_id, "config.json")`. Returns `None` if not cached → show hint. If it raises or returns a path → no hint. Keep in try/except; hint is best-effort.
 
 ---
 
-## 1. Simplified Status Bar
+## 2. Cleaner App Picker (`__main__.py`)
 
-**Goal**: `🎧 3:45 · $0.13` in normal mode; verbose stats → debug log only.
+### Replace `_pick_app` with ANSI in-place rewrite
 
-### pipeline.py — `transcribe_and_translate()` status block (~line 270-280)
+Key behaviors:
+- Print header line: `"  Choose app (type to filter, Enter to select):"`
+- Below: up to **10** filtered items + optional `"  ... N more"` line
+- Below: input prompt `"  Filter: {query}_"`
+- On each keystroke: erase all printed lines (MOVE_UP + CLEAR_LINE), reprint
+- Uses `sys.stdin` raw mode to capture single keystrokes (no Enter needed for filtering)
 
-Replace the status string construction:
-
-```python
-# BEFORE
-status = (
-    f"{speaker_label}listening · windows: {windows_processed} · "
-    f"avg: {avg_ms:.0f}ms · buf: {buf_seconds:.0f}s · "
-    f"{runtime // 60}:{runtime % 60:02d} · {cost_str}"
-)
-
-# AFTER
-logger.debug(
-    "stats | windows=%d avg=%.0fms buf=%.0fs",
-    windows_processed, avg_ms, buf_seconds,
-)
-runtime_str = f"{runtime // 60}:{runtime % 60:02d}"
-cost_display = f"${translator.estimated_cost():.2f}" if translator else ""
-status = f"🎧 {runtime_str} · {cost_display}".rstrip(" ·")
-```
-
-- Cost rounds to 2 decimal places (not 3) — cleaner
-- `speaker_label` removed from status (moved to inline text — see §3)
-- Verbose stats go to `logger.debug` so `--debug` flag still shows them
-
----
-
-## 2. Silence / Listening Feedback
-
-**Goal**: When silence > 2s, status shows `⏸ waiting for speech...` instead of frozen `🎧`. Speech resumption flips back.
-
-### pipeline.py changes
-
-**A) Add silence state to status block** (same area, after building `runtime_str`/`cost_display`):
+### Implementation
 
 ```python
-silence_duration = time.time() - last_speech_time  # already computed above
+import tty, termios
 
-if silence_duration > 2.0:
-    status = f"⏸  waiting for speech... · {runtime_str} · {cost_display}".rstrip(" ·")
-else:
-    status = f"🎧 {runtime_str} · {cost_display}".rstrip(" ·")
+def _pick_app(apps: list[str]) -> str:
+    last = _load_last_session()
+    last_app = last.get("app")
+    if last_app and last_app in apps:
+        apps = [last_app] + [a for a in apps if a != last_app]
+
+    query = ""
+    filtered = apps
+    MAX_VISIBLE = 10
+    selected_idx = 0  # cursor position in filtered list
+
+    # Save terminal state for raw mode
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+
+    MOVE_UP = "\033[A"
+    CLEAR_LINE = "\033[2K"
+
+    def _draw(lines_to_erase: int) -> int:
+        """Erase previous output, draw current state. Returns lines drawn."""
+        # Erase
+        for _ in range(lines_to_erase):
+            sys.stdout.write(f"{MOVE_UP}{CLEAR_LINE}\r")
+
+        shown = filtered[:MAX_VISIBLE]
+        lines = 0
+
+        # Items
+        for i, app in enumerate(shown):
+            marker = "→" if i == selected_idx else " "
+            tag = " (last)" if app == last_app and not query else ""
+            sys.stdout.write(f"  {marker} [{i+1}] {app}{tag}\n")
+            lines += 1
+
+        if not shown:
+            sys.stdout.write("    No matches\n")
+            lines += 1
+
+        if len(filtered) > MAX_VISIBLE:
+            sys.stdout.write(f"    ... {len(filtered) - MAX_VISIBLE} more\n")
+            lines += 1
+
+        # Prompt
+        sys.stdout.write(f"  Filter: {query}█")
+        sys.stdout.flush()
+        lines += 1  # prompt line (no \n — cursor stays on it)
+
+        return lines
+
+    try:
+        # Initial draw
+        sys.stdout.write("\n  Choose app (type to filter, Enter to select):\n")
+        drawn = _draw(0)
+
+        tty.setraw(fd)
+        while True:
+            ch = sys.stdin.read(1)
+
+            if ch == '\r' or ch == '\n':  # Enter
+                # Need to move past drawn content cleanly
+                break
+            elif ch == '\x03':  # Ctrl-C
+                raise KeyboardInterrupt
+            elif ch == '\x7f' or ch == '\x08':  # Backspace
+                query = query[:-1]
+            elif ch == '\x1b':  # Escape sequence (arrows)
+                seq = sys.stdin.read(2)
+                if seq == '[A':  # Up
+                    selected_idx = max(0, selected_idx - 1)
+                elif seq == '[B':  # Down
+                    selected_idx = min(len(filtered[:MAX_VISIBLE]) - 1, selected_idx + 1)
+                continue  # redraw below
+            elif ch.isprintable():
+                query += ch
+            else:
+                continue
+
+            # Refilter
+            if ch != '\x1b':
+                filtered = [a for a in apps if query.lower() in a.lower()] if query else apps
+                selected_idx = 0
+                if len(filtered) == 1:
+                    break
+
+            drawn = _draw(drawn)
+
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        # Clean exit: erase the picker, print selection
+        for _ in range(drawn):
+            sys.stdout.write(f"{MOVE_UP}{CLEAR_LINE}\r")
+        sys.stdout.flush()
+
+    if filtered:
+        choice = filtered[min(selected_idx, len(filtered) - 1)]
+        sys.stdout.write(f"  ✓ {choice}\n")
+        sys.stdout.flush()
+        return choice
+
+    # Fallback — shouldn't reach
+    return apps[0]
 ```
 
-Note: `silence_duration` is already calculated earlier in the loop (~line 207). Reuse that value — don't recompute. Move or hoist the variable so it's available at status-build time. Currently it's inside an `if` block that only fires when `silence_duration > cfg.silence_reset_seconds`. Fix:
+### Edge cases
 
-- Move `silence_duration = time.time() - last_speech_time` to just after `await asyncio.sleep(cfg.process_interval)` (before the `buf_seconds` line), so it's always available.
-- Keep the existing `> cfg.silence_reset_seconds` reset logic where it is — it still references the same variable.
+- **`drawn` tracking**: `_draw` returns count of lines written (items + overflow + prompt). The prompt line counts as 1 even though no trailing `\n` — the next `_draw` call's MOVE_UP will handle it because cursor is on that line.
+- **Raw mode restore**: `finally` block ensures terminal is always restored, even on Ctrl-C.
+- **No stdin.fileno()** (piped input): wrap the raw-mode block in try/except `OSError` and fall back to the current simple picker. This keeps `--app` CLI path working.
+- **Arrow keys**: Up/Down move `selected_idx` within visible items. Enter selects at cursor.
 
-**B) Early-cycle status update**: Currently display only updates after whisper processes. During long silence, the `continue` at line ~220 skips the display update entirely. Fix: before every `continue` in the silence/buffer-too-small early exits, update the display with the silence status:
+### Fallback guard
 
 ```python
-if silence_duration > cfg.silence_reset_seconds:
-    # ... existing reset logic ...
-    if buf_seconds < cfg.min_audio_seconds:
-        runtime = int(time.time() - start_time)
-        runtime_str = f"{runtime // 60}:{runtime % 60:02d}"
-        cost_display = f"${translator.estimated_cost():.2f}" if translator else ""
-        display.update(locked_text, "", f"⏸  waiting for speech... · {runtime_str} · {cost_display}".rstrip(" ·"))
-        continue
+try:
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+except (OSError, termios.error):
+    # Non-interactive — fall back to simple input() picker
+    return _pick_app_simple(apps)  # extract current logic into this
 ```
-
-Where `locked_text` = `translator.confirmed_translation` if translator else `confirmed_source`.
-
-Extract a helper to avoid duplication:
-
-```python
-def _build_status() -> str:
-    runtime = int(time.time() - start_time)
-    runtime_str = f"{runtime // 60}:{runtime % 60:02d}"
-    cost_display = f"${translator.estimated_cost():.2f}" if translator else ""
-    silence_dur = time.time() - last_speech_time
-    if silence_dur > 2.0:
-        return f"⏸  waiting for speech... · {runtime_str} · {cost_display}".rstrip(" ·")
-    return f"🎧 {runtime_str} · {cost_display}".rstrip(" ·")
-```
-
-Define this as a closure inside `transcribe_and_translate()` (it captures `start_time`, `last_speech_time`, `translator`). Use it everywhere status is needed.
-
----
-
-## 3. Speaker Colours in Text
-
-**Goal**: When `--diarize`, insert coloured `\n[Speaker A] ` into locked text on speaker change. Up to 6 colours.
-
-### display.py changes
-
-**A) Add speaker colour constants:**
-
-```python
-SPEAKER_COLOURS = [
-    "\033[36m",  # cyan
-    "\033[33m",  # yellow
-    "\033[32m",  # green
-    "\033[35m",  # magenta
-    "\033[34m",  # blue
-    "\033[91m",  # bright red
-]
-```
-
-No display.py logic changes needed beyond this — the speaker tags will be embedded in the locked text string itself (with ANSI codes), and `_wrap_lines` / the renderer already pass them through. The `BOLD` wrapper on locked lines will combine with the colour codes fine.
-
-**B) However**: `_wrap_lines` uses `len()` for width calc, which counts ANSI escape chars. Fix `_wrap_lines` to strip ANSI when measuring width:
-
-```python
-_ANSI_RE = re.compile(r'\033\[[0-9;]*m')
-
-def _visible_len(s: str) -> int:
-    return len(_ANSI_RE.sub('', s))
-```
-
-Update `_wrap_lines` to use `_visible_len()` instead of `len()` for width checks.
-
-### pipeline.py changes
-
-**A) Track previous speaker** — add state var:
-
-```python
-prev_speaker: str | None = None
-```
-
-**B) Build a speaker colour map** — add near speaker_tracker init:
-
-```python
-from .display import SPEAKER_COLOURS
-speaker_colour_map: dict[str, str] = {}  # speaker name → ANSI colour
-```
-
-**C) Inject speaker tags into locked text** — in the diarization block (~line 262):
-
-```python
-# ── diarization ──
-if speaker_tracker and speaker_tracker.available:
-    speaker_tracker.process()
-    cur = speaker_tracker.current_speaker()
-    if cur and cur != prev_speaker and confirmed:
-        # Assign colour
-        if cur not in speaker_colour_map:
-            idx = len(speaker_colour_map) % len(SPEAKER_COLOURS)
-            speaker_colour_map[cur] = SPEAKER_COLOURS[idx]
-        colour = speaker_colour_map[cur]
-        # Inject speaker tag into confirmed_source (the locked text source)
-        tag = f"\n{colour}[{cur}]\033[0m "
-        # Insert before the latest confirmed chunk
-        # confirmed_source already has the new confirmed appended above
-        # We need to insert the tag before the last addition
-        # Approach: track where we appended and insert tag there
-        confirmed_source = confirmed_source.rstrip()
-        confirmed_source += tag
-        prev_speaker = cur
-    elif cur:
-        prev_speaker = cur  # track even if no confirmed text yet
-```
-
-Wait — this has a timing issue. The confirmed text is appended *before* the diarization block. Restructure:
-
-**Better approach**: Insert the tag *when appending confirmed text*, not after. Move diarization check to just before the `confirmed_source += confirmed` line:
-
-```python
-if confirmed:
-    # Speaker change detection (before appending)
-    if speaker_tracker and speaker_tracker.available:
-        speaker_tracker.process()
-        cur = speaker_tracker.current_speaker()
-        if cur and cur != prev_speaker:
-            if cur not in speaker_colour_map:
-                idx = len(speaker_colour_map) % len(SPEAKER_COLOURS)
-                speaker_colour_map[cur] = SPEAKER_COLOURS[idx]
-            colour = speaker_colour_map[cur]
-            tag = f"\n{colour}[{cur}]\033[0m "
-            confirmed_source += tag
-            prev_speaker = cur
-
-    confirmed_source += (" " + confirmed if confirmed_source else confirmed)
-```
-
-Move the existing `speaker_tracker.process()` call from its current location (line ~262) into this block. Keep a second `speaker_tracker.process()` call in the original spot for the case when there's no confirmed text but we still want to keep diarization warm:
-
-```python
-# ── diarization (keep model warm even without confirmed text) ──
-if speaker_tracker and speaker_tracker.available and not confirmed:
-    speaker_tracker.process()
-```
-
-**D) Remove old speaker_label from status string** — it's now inline. Delete the block at ~line 260-264 that builds `speaker_label`.
-
-### diarize.py
-
-No changes needed. `current_speaker()` and `_map_speaker()` already produce stable `Speaker A/B/C` labels.
 
 ---
 
 ## File change summary
 
 | File | Changes |
-|------|---------|
-| `display.py` | Add `SPEAKER_COLOURS`, `_ANSI_RE`, `_visible_len()`. Fix `_wrap_lines` width calc. |
-| `pipeline.py` | Extract `_build_status()` closure. Simplify status string. Add silence feedback. Move diarization to pre-append. Inject coloured speaker tags. Remove `speaker_label` from status. |
-| `diarize.py` | No changes. |
+|---|---|
+| `display.py` | Add `Spinner` class (~40 LOC). Add `import asyncio, time` |
+| `pipeline.py` | Replace static loading msg with `Spinner` usage. Add first-run detection via `huggingface_hub.try_to_load_from_cache`. Import `Spinner` |
+| `__main__.py` | Rewrite `_pick_app` with raw-mode ANSI picker. Add `import tty, termios`. Extract old logic to `_pick_app_simple` as fallback |
 
-## Testing notes
+## Testing
 
-- Test without `--diarize`: should show simplified status, silence feedback
-- Test with `--diarize`: speaker tags in text, colours cycle
-- Test `--plain` mode: ANSI codes won't render — consider stripping speaker colour codes in plain mode (add `if not self.plain` guard, or strip in `update()` when `self.plain`)
-- Test long sessions: verify `_visible_len` doesn't regress wrap performance
+- `langlistn` — interactive: verify spinner animates during load, shows elapsed, hint on first run
+- `langlistn` — interactive: verify app picker redraws in-place, arrow keys work, backspace filters, Enter selects, Ctrl-C exits clean
+- `langlistn --app "Chrome" --source ko` — verify no regression (bypasses picker entirely)
+- Pipe test: `echo "" | langlistn` — verify graceful fallback (no raw-mode crash)

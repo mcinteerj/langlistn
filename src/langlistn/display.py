@@ -8,9 +8,11 @@ erase the erasable zone (last locked line + speculative + status), print
 any new permanent locked lines, then redraw the erasable zone.
 """
 
+import asyncio
 import re
 import shutil
 import sys
+import time
 
 BOLD = "\033[1m"
 DIM = "\033[2m"
@@ -39,6 +41,49 @@ def _visible_len(s: str) -> int:
 _SENTENCE_END = re.compile(r'([.!?。！？…])\s+')
 
 PARAGRAPH_INTERVAL = 3  # Insert blank line every N sentences
+
+
+class Spinner:
+    """Animated braille spinner with elapsed time. Thread-safe start/stop."""
+
+    FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    INTERVAL = 0.1
+
+    def __init__(self, message: str, hint: str = ""):
+        self._message = message
+        self._hint = hint
+        self._task: asyncio.Task | None = None
+        self._start_time: float = 0
+
+    async def start(self):
+        self._start_time = time.time()
+        self._task = asyncio.create_task(self._animate())
+
+    async def _animate(self):
+        idx = 0
+        try:
+            while True:
+                elapsed = time.time() - self._start_time
+                frame = self.FRAMES[idx % len(self.FRAMES)]
+                parts = f"  {frame} {self._message} ({elapsed:.1f}s)"
+                if self._hint:
+                    parts += f"  {DIM}{self._hint}{RESET}"
+                sys.stdout.write(f"\r{CLEAR_LINE}{parts}")
+                sys.stdout.flush()
+                idx += 1
+                await asyncio.sleep(self.INTERVAL)
+        except asyncio.CancelledError:
+            elapsed = time.time() - self._start_time
+            sys.stdout.write(f"\r{CLEAR_LINE}  ✓ {self._message} ({elapsed:.1f}s)\n")
+            sys.stdout.flush()
+
+    async def stop(self):
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
 
 
 def _add_paragraph_breaks(text: str) -> str:
