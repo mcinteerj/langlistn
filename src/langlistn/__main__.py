@@ -1,5 +1,20 @@
 """CLI entry point for langlistn."""
 
+import os
+
+# Prevent tqdm/huggingface from spawning multiprocessing resource tracker
+# which fails inside Textual due to non-inheritable FDs.
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+os.environ["TQDM_DISABLE"] = "1"
+
+# Pre-start the multiprocessing resource tracker BEFORE Textual takes over
+# the terminal FDs. This ensures it's already running when tqdm needs it.
+try:
+    import multiprocessing.resource_tracker as _rt
+    _rt.ensure_running()
+except Exception:
+    pass
+
 import argparse
 import asyncio
 import json
@@ -62,8 +77,8 @@ environment variables:
                         help="Azure OpenAI deployment name (default: gpt-realtime-mini)")
     parser.add_argument("--local", action="store_true",
                         help="Use local Whisper instead of OpenAI Realtime API (free, offline)")
-    parser.add_argument("--model", metavar="NAME", default="mlx-community/whisper-large-v3-turbo",
-                        help="Whisper model for --local mode (default: mlx-community/whisper-large-v3-turbo)")
+    parser.add_argument("--model", metavar="NAME", default="mlx-community/whisper-large-v3-mlx",
+                        help="Whisper model for --local mode (default: mlx-community/whisper-large-v3-mlx)")
     parser.add_argument("--json", dest="output_json", action="store_true", help="JSON output (for --list-*)")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
 

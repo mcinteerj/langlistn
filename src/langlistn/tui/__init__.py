@@ -2,10 +2,13 @@
 
 import asyncio
 import json
+import logging
 import re
 import time
 from datetime import timedelta
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from textual.app import App, ComposeResult
 from ..realtime import EventKind
@@ -170,7 +173,13 @@ class TranslateApp(App):
             # Start audio capture FIRST — subprocess must be created before
             # mlx/torch imports can taint the file descriptor table
             self.set_status("starting audio capture...")
-            await self._audio_source.start()
+            try:
+                await self._audio_source.start()
+            except Exception as e:
+                import traceback
+                logger.error("Audio start failed:\n%s", traceback.format_exc())
+                self.set_status(f"audio error: {e}")
+                return
             self.set_status("connecting to API...")
             await self._session.connect()
             await asyncio.gather(

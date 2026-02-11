@@ -7,10 +7,11 @@ import math
 import os
 import time
 
-# Prevent torch multiprocessing from inheriting file descriptors
-# which causes "bad value(s) in fds_to_keep" inside Textual's event loop
-os.environ.setdefault("TORCH_NUM_THREADS", "1")
-os.environ.setdefault("OMP_NUM_THREADS", "1")
+# Prevent tqdm from creating multiprocessing locks inside Textual's event loop.
+# tqdm → multiprocessing.RLock → resource_tracker → spawnv_passfds fails because
+# Textual's terminal FDs are in a non-inheritable state.
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("TQDM_DISABLE", "1")
 from collections import deque
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
@@ -124,7 +125,7 @@ class LocalWhisperSession:
     def __init__(
         self,
         lang: str | None = None,
-        model: str = "mlx-community/whisper-large-v3-turbo",
+        model: str = "mlx-community/whisper-large-v3-mlx",
         task: str = "translate",
     ):
         self.lang = lang
@@ -167,9 +168,30 @@ class LocalWhisperSession:
         """Load the Whisper model."""
         await self._emit(EventKind.STATUS, f"loading model {self.model_name}...")
 
-        # Load model in executor to avoid blocking event loop
+        # Load model in a background thread to avoid blocking event loop.
+        # Use threading directly since Textual's event loop can have FD issues
+        # with asyncio.run_in_executor.
+        import threading
+        load_error = None
+        load_done = asyncio.Event()
+
+        def _bg_load():
+            nonlocal load_error
+            try:
+                self._load_model()
+            except Exception as e:
+                load_error = e
+            finally:
+                # Schedule the event set on the event loop
+                loop.call_soon_threadsafe(load_done.set)
+
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._load_model)
+        thread = threading.Thread(target=_bg_load, daemon=True)
+        thread.start()
+        await load_done.wait()
+
+        if load_error:
+            raise load_error
 
         self.stats.connect_time = time.time()
         await self._emit(EventKind.STATUS, "model loaded · waiting for audio")

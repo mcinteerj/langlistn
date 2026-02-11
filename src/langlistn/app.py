@@ -18,7 +18,7 @@ async def run_app(
     log_path: str | None = None,
     show_transcript: bool = False,
     local: bool = False,
-    model: str = "mlx-community/whisper-large-v3-turbo",
+    model: str = "mlx-community/whisper-large-v3-mlx",
 ) -> None:
     from .config import resolve_language_name
 
