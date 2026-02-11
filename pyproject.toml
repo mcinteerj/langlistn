@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "langlistn"
 version = "0.1.0"
-description = "Real-time audio translation and transcription to English"
+description = "Real-time audio to English text — transcription and translation"
 requires-python = ">=3.11"
 license = {text = "MIT"}
 readme = "README.md"

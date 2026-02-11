@@ -1,8 +1,8 @@
 # langlistn
 
-Real-time audio translation to English. Captures audio from any macOS app or microphone, streams it to OpenAI's Realtime API, and displays rolling English text in a terminal UI.
+Real-time audio to English text. Captures audio from any macOS app or microphone, streams it to OpenAI's Realtime API, and displays rolling English text in a terminal UI.
 
-Built for following meetings, calls, or videos in languages you don't speak. Source language is auto-detected — just point it at an app and go.
+Transcribes English speech directly. Translates foreign languages into English automatically. Built for following meetings, calls, or videos — just point it at an app and go.
 
 > **macOS 15+** · **Python 3.11+** · **Azure OpenAI** with `gpt-realtime-mini` or `gpt-realtime`
 
@@ -16,7 +16,7 @@ flowchart TD
     D -->|streaming text| E["Terminal UI<br/>live translation<br/>cost tracking"]
 ```
 
-**Swift** captures per-app audio via ScreenCaptureKit, applies an anti-alias filter, and resamples to 16kHz PCM16 mono. **Python** skips silence, upsamples to 24kHz (OpenAI requirement), and streams over WebSocket. **OpenAI** handles voice activity detection, transcription, and translation. The **TUI** streams text word-by-word as it arrives.
+**Swift** captures per-app audio via ScreenCaptureKit, applies an anti-alias filter, and resamples to 16kHz PCM16 mono. **Python** skips silence, upsamples to 24kHz (OpenAI requirement), and streams over WebSocket. **OpenAI** handles voice activity detection, transcription, and translation when needed. The **TUI** streams text word-by-word as it arrives.
 
 ## Quick start
 
@@ -148,7 +148,7 @@ Auto-detects any language Whisper supports — these codes are hints, not requir
 
 ## Cost
 
-> **⚠️ Cost warning:** langlistn streams audio to OpenAI's Realtime API, which bills per token. With `gpt-realtime-mini` (default), expect roughly **$0.01–0.03/minute** — a 1-hour session costs **~$0.60–1.80**. The full `gpt-realtime` model is ~10× more expensive. Silence is detected client-side and not sent, which helps. Monitor costs in the status bar and your Azure dashboard.
+> **⚠️ Cost warning:** langlistn streams audio to OpenAI's Realtime API, which bills per token. With `gpt-realtime-mini` (default), expect roughly **$0.10–0.20/minute** — a 1-hour session costs **~$6–12**. The full `gpt-realtime` model is ~10× more expensive. Silence is detected client-side and not sent, which helps. Monitor costs in the status bar and your Azure dashboard.
 
 ## Troubleshooting
 
