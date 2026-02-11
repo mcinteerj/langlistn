@@ -198,6 +198,20 @@ def _pick_app(apps: list[str]) -> str:
                 drawn = _draw(drawn)
                 tty.setraw(fd)
                 continue
+            elif ch.isdigit():
+                # Direct number selection from visible filtered list
+                idx = int(ch) - 1
+                shown = filtered[:MAX_VISIBLE]
+                if 0 <= idx < len(shown):
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                    for _ in range(drawn):
+                        sys.stdout.write(f"{MOVE_UP}{CLEAR_LINE}\r")
+                    sys.stdout.flush()
+                    choice = shown[idx]
+                    sys.stdout.write(f"  ✓ {choice}\n")
+                    sys.stdout.flush()
+                    return choice
+                continue
             elif ch.isprintable():
                 query += ch
             else:
