@@ -24,6 +24,7 @@ dependencies = [
     "websockets>=13.0",
     "sounddevice>=0.5",
     "textual>=3.0",
+    "python-dotenv>=1.0",
 ]
 
 [tool.setuptools.packages.find]

@@ -33,16 +33,27 @@ class MicCapture:
         self._device = device
         self._queue: queue.Queue[bytes] = queue.Queue(maxsize=200)
         self._stream: sd.RawInputStream | None = None
+        self._drop_count: int = 0
 
-    def _callback(self, indata: bytes, frames: int, time_info, status):
+    def _callback(self, indata: bytes, frames: int, time_info, status) -> None:
         if status:
             logger.warning("mic audio status: %s", status)
         try:
             self._queue.put_nowait(bytes(indata))
         except queue.Full:
-            pass  # drop frame rather than block audio thread
+            self._drop_count += 1
+            if self._drop_count % 50 == 1:
+                logger.warning("mic queue full — dropped %d frames", self._drop_count)
 
     async def start(self) -> None:
+        # Drain any stale data from previous session
+        while not self._queue.empty():
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+        self._drop_count = 0
+
         try:
             self._stream = sd.RawInputStream(
                 samplerate=SAMPLE_RATE,
@@ -77,7 +88,15 @@ class MicCapture:
 
     async def stop(self) -> tuple[int, str]:
         if self._stream:
-            self._stream.stop()
-            self._stream.close()
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                pass
             self._stream = None
         return 0, ""
+
+    @property
+    def returncode(self) -> int | None:
+        """Compatibility with AppCapture interface. No subprocess."""
+        return None

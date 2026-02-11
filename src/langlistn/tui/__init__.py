@@ -2,11 +2,15 @@
 
 import asyncio
 import json
+import re
 import time
 from datetime import timedelta
 from pathlib import Path
 
 from textual.app import App, ComposeResult
+from textual.containers import VerticalScroll
+
+from ..realtime import EventKind
 from textual.reactive import reactive
 from textual.widgets import Footer, RichLog, Static
 
@@ -71,24 +75,28 @@ class TranslateApp(App):
     Screen {
         layout: vertical;
     }
-    #output {
+    #scroll-area {
         height: 1fr;
         border: round $accent;
+        background: $background;
+    }
+    #output {
+        height: auto;
         padding: 0 1;
+        background: $background;
     }
     #live {
         height: auto;
-        max-height: 4;
         padding: 0 1;
         color: $text;
     }
     #status {
-        height: 1;
+        height: auto;
         text-align: center;
         color: $text-muted;
     }
     #header-info {
-        height: 1;
+        height: auto;
         text-align: center;
         color: $text;
     }
@@ -96,7 +104,7 @@ class TranslateApp(App):
 
     BINDINGS = [
         ("q", "quit", "Quit"),
-        ("t", "toggle_transcript", "Transcript"),
+        ("o", "toggle_original", "Original"),
         ("l", "toggle_log", "Log"),
         ("c", "clear_display", "Clear"),
     ]
@@ -116,7 +124,7 @@ class TranslateApp(App):
         self._source_code = source_code
         self._mode = mode
         self._start_time = time.time()
-        self._show_transcript = False
+        self._show_original = False
         self._log_file = None
         self._log_path = log_path
         self._session = session
@@ -125,7 +133,17 @@ class TranslateApp(App):
         config = load_config()
         self.theme = config.get("theme", DEFAULT_THEME)
         if log_path:
-            self._log_file = open(log_path, "a", encoding="utf-8")
+            try:
+                self._log_file = open(log_path, "a", encoding="utf-8")
+            except OSError as e:
+                self._log_file = None
+                self._log_path = None
+                # Will show error once TUI mounts
+                self._init_error = f"Could not open log file: {e}"
+            else:
+                self._init_error = None
+        else:
+            self._init_error = None
 
     def compose(self) -> ComposeResult:
         if self._source_lang and self._source_code:
@@ -134,23 +152,26 @@ class TranslateApp(App):
             src = self._source_code
         else:
             src = None
-        target = "English (en)"
-        lang_display = f"{src} → {target}" if src else target
+        target = "English"
+        lang_display = f"{src} → {target}" if src else f"auto-detect → {target}"
         yield Static(f"langlistn ── {lang_display} ── {self._mode}", id="header-info")
-        yield RichLog(id="output", wrap=True, highlight=True, markup=True, auto_scroll=True)
-        yield LiveText(id="live")
+        with VerticalScroll(id="scroll-area"):
+            yield RichLog(id="output", wrap=True, highlight=True, markup=True, auto_scroll=False)
+            yield LiveText(id="live")
         yield StatusBar(id="status")
         yield Footer()
 
     async def on_mount(self) -> None:
         """Start background tasks once the TUI event loop is running."""
         self.set_interval(1.0, self._tick)
+        if self._init_error:
+            self.set_status(self._init_error)
         if self._session and self._audio_source:
             t1 = asyncio.create_task(self._run_background())
             self._bg_tasks.append(t1)
 
     async def _run_background(self) -> None:
-        """Connect API and run audio + receive concurrently."""
+        """Connect API and run audio + receive + watchdog concurrently."""
         try:
             self.set_status("connecting to API...")
             await self._session.connect()
@@ -158,6 +179,7 @@ class TranslateApp(App):
                 self._audio_loop(),
                 self._session.receive_loop(),
                 self._receive_loop(),
+                self._session.commit_watchdog(),
             )
         except asyncio.CancelledError:
             pass
@@ -174,7 +196,12 @@ class TranslateApp(App):
             while True:
                 chunk = await self._audio_source.read_chunk()
                 if chunk is None:
-                    self.set_status("audio source ended")
+                    # Check if helper crashed
+                    rc = self._audio_source.returncode
+                    if rc is not None and rc != 0:
+                        self.set_status(f"audio capture crashed (exit {rc})")
+                    else:
+                        self.set_status("audio source ended")
                     break
                 await self._session.send_audio(chunk)
                 chunk_count += 1
@@ -197,15 +224,15 @@ class TranslateApp(App):
                     )
                 except asyncio.TimeoutError:
                     continue
-                if event.kind == "text":
+                if event.kind == EventKind.TEXT:
                     self.append_text(event.data)
-                elif event.kind == "turn_complete":
+                elif event.kind == EventKind.TURN_COMPLETE:
                     self.finalize_segment()
-                elif event.kind == "transcript":
+                elif event.kind == EventKind.TRANSCRIPT:
                     self.append_transcript(event.data)
-                elif event.kind == "status":
+                elif event.kind == EventKind.STATUS:
                     self.set_status(event.data)
-                elif event.kind == "error":
+                elif event.kind == EventKind.ERROR:
                     self.set_status(f"error: {event.data}")
         except asyncio.CancelledError:
             pass
@@ -234,11 +261,13 @@ class TranslateApp(App):
         try:
             live = self.query_one("#live", LiveText)
             live.append(text)
+            scroll = self.query_one("#scroll-area", VerticalScroll)
+            scroll.scroll_end(animate=False)
         except Exception:
             pass
 
     def append_transcript(self, text: str) -> None:
-        if self._show_transcript:
+        if self._show_original:
             try:
                 log = self.query_one("#output", RichLog)
                 log.write(f"[dim italic]〈{text}〉[/]")
@@ -249,21 +278,25 @@ class TranslateApp(App):
         """Move in-progress text to the history log."""
         try:
             live = self.query_one("#live", LiveText)
-            text = live.clear_text()
-            if text.strip():
+            text = live.clear_text().strip()
+            # Drop incomplete speaker labels (e.g. bare "Speaker" or "Speaker 1:")
+            import re
+            cleaned = re.sub(r"^Speaker\s*\d*:?\s*$", "", text, flags=re.IGNORECASE).strip()
+            if cleaned:
                 log = self.query_one("#output", RichLog)
-                log.write(text.strip())
-                log.scroll_end(animate=False)
+                log.write(text)
+                scroll = self.query_one("#scroll-area", VerticalScroll)
+                scroll.scroll_end(animate=False)
                 if self._log_file:
-                    self._log_file.write(text.strip() + "\n")
+                    self._log_file.write(text + "\n")
                     self._log_file.flush()
         except Exception:
             pass
 
-    def action_toggle_transcript(self) -> None:
-        self._show_transcript = not self._show_transcript
-        state = "on" if self._show_transcript else "off"
-        self.set_status(f"transcript {state}")
+    def action_toggle_original(self) -> None:
+        self._show_original = not self._show_original
+        state = "on" if self._show_original else "off"
+        self.set_status(f"original language {state}")
 
     def action_toggle_log(self) -> None:
         if self._log_file:
@@ -276,7 +309,11 @@ class TranslateApp(App):
         else:
             ts = time.strftime("%Y%m%d-%H%M%S")
             path = str(Path.home() / f"langlistn-{ts}.txt")
-            self._log_file = open(path, "a", encoding="utf-8")
+            try:
+                self._log_file = open(path, "a", encoding="utf-8")
+            except OSError as e:
+                self.set_status(f"log error: {e}")
+                return
             self._log_path = path
             status = self.query_one("#status", StatusBar)
             status.log_path = path
@@ -297,8 +334,14 @@ class TranslateApp(App):
     async def cleanup(self) -> None:
         for task in self._bg_tasks:
             task.cancel()
+        # Wait for tasks to actually finish
+        if self._bg_tasks:
+            await asyncio.gather(*self._bg_tasks, return_exceptions=True)
         if self._session:
-            await self._session.shutdown()
+            try:
+                await asyncio.wait_for(self._session.shutdown(), timeout=5.0)
+            except (asyncio.TimeoutError, Exception):
+                pass
         if self._audio_source:
             await self._audio_source.stop()
         if self._log_file:

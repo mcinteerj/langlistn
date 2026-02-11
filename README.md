@@ -1,51 +1,50 @@
 # langlistn
 
-Real-time audio translation and transcription to English. Captures audio from any macOS app (Zoom, Teams, Chrome, etc.) or microphone, streams it to OpenAI's Realtime API, and displays rolling English text in a terminal TUI.
+Real-time audio translation to English. Captures audio from any macOS app or microphone, streams it to OpenAI's Realtime API, and displays rolling English text in a terminal UI.
 
-Built for following meetings, calls, or videos in languages you don't speak fluently. Source language is auto-detected — just point it at an app and go.
+Built for following meetings, calls, or videos in languages you don't speak. Source language is auto-detected — just point it at an app and go.
 
-> **Note:** Requires **macOS 15+** and an **Azure OpenAI** account with a `gpt-4o-realtime-preview` deployment.
+> **macOS 15+** · **Python 3.11+** · **Azure OpenAI** with `gpt-realtime-mini` or `gpt-realtime`
 
 ## How it works
 
 ```mermaid
-flowchart LR
-    A["🎧 macOS App\n(or mic)"] -->|audio| B["Swift Helper\nScreenCaptureKit\n48→16kHz"]
-    B -->|PCM16 stdout| C["Python\n16→24kHz\nbase64 PCM16"]
-    C -->|WebSocket| D["OpenAI\nRealtime API"]
-    D -->|text deltas| E["Textual TUI\nstreaming text\n+ cost tracker"]
+flowchart TD
+    A["🎧 App or Mic"] -->|audio| B["Swift Helper<br/>ScreenCaptureKit<br/>anti-alias + resample"]
+    B -->|16kHz PCM16| C["Python<br/>silence gate<br/>upsample to 24kHz"]
+    C -->|WebSocket| D["OpenAI Realtime API<br/>VAD + Whisper + GPT"]
+    D -->|streaming text| E["Terminal UI<br/>live translation<br/>cost tracking"]
 ```
 
-- **Swift helper** uses ScreenCaptureKit to capture per-app audio, resamples to 16kHz PCM16 mono
-- **Python** upsamples to 24kHz (OpenAI requirement), base64-encodes, streams over WebSocket
-- **OpenAI Realtime API** (Azure) handles VAD, Whisper transcription, and GPT-4o translation
-- **Textual TUI** streams text word-by-word as it arrives, with cost tracking
+**Swift** captures per-app audio via ScreenCaptureKit, applies an anti-alias filter, and resamples to 16kHz PCM16 mono. **Python** skips silence, upsamples to 24kHz (OpenAI requirement), and streams over WebSocket. **OpenAI** handles voice activity detection, transcription, and translation. The **TUI** streams text word-by-word as it arrives.
 
 ## Quick start
+
+### Prerequisites
+
+- macOS 15+
+- Xcode Command Line Tools: `xcode-select --install`
+- Python 3.11+
+- An Azure OpenAI account with a `gpt-realtime-mini` (or `gpt-realtime`) deployment
 
 ### 1. Clone and install
 
 ```bash
 git clone https://github.com/mcinteerj/langlistn.git
 cd langlistn
-
-# Add to PATH (optional — or run ./langlistn directly)
-ln -sf "$(pwd)/langlistn" ~/bin/langlistn
 ```
 
-First run automatically builds the Swift helper and creates a Python venv.
+First run automatically builds the Swift helper and creates a Python venv (~30s on first launch, instant after).
 
 ### 2. Configure Azure OpenAI
 
-1. Go to [Azure OpenAI Studio](https://oai.azure.com/)
-2. Create or select a resource
-3. Deploy the **gpt-4o-realtime-preview** model
-4. Name the deployment `gpt-realtime` (or use `--deployment` to override)
-5. Copy the API key and endpoint URL
+1. In [Azure OpenAI Studio](https://oai.azure.com/), deploy a **Realtime** model
+2. Name the deployment `gpt-realtime-mini` (default) or `gpt-realtime`, or use `--deployment` to override
+3. Copy your API key and endpoint URL
 
 ```bash
 cp .env.example .env
-# Edit .env with your values:
+# Edit .env:
 #   AZURE_OPENAI_API_KEY=your-key
 #   OPENAI_API_BASE=https://your-resource.openai.azure.com/
 ```
@@ -59,48 +58,82 @@ export OPENAI_API_BASE="https://your-resource.openai.azure.com/"
 
 ### 3. Grant macOS permissions
 
-In **System Settings → Privacy & Security**, grant your terminal app (iTerm2, Terminal.app) **both**:
+Your terminal app needs **two separate permissions** in System Settings → Privacy & Security:
 
-- **Screen & System Audio Recording**
-- **System Audio Recording Only**
+1. **Screen & System Audio Recording** — lets the helper attach to app audio streams
+2. **System Audio Recording Only** — required additionally on macOS 15
 
-Both are required on macOS 15. **Restart your terminal after granting permissions.**
+**Restart your terminal after granting permissions.**
 
 ### 4. Run
 
 ```bash
-langlistn --app "Google Chrome"
+./langlistn --app "Google Chrome"
 ```
 
-## Usage examples
+## Usage
+
+### App audio capture
 
 ```bash
-# Translate any app's audio (auto-detects language)
-langlistn --app "Google Chrome"
-langlistn --app "zoom.us"
-langlistn --app "Microsoft Teams"
-langlistn --app "Spotify"
-langlistn --app "Safari"
+# Auto-detect language — just point at any app
+./langlistn --app "Google Chrome"
+./langlistn --app "zoom.us"
+./langlistn --app "Microsoft Teams"
+./langlistn --app "Spotify"
+./langlistn --app "Safari"
+./langlistn --app "Discord"
+```
 
-# Hint source language for better accuracy
-langlistn --app "Google Chrome" --source ko    # Korean
-langlistn --app "Google Chrome" --source ja    # Japanese
-langlistn --app "zoom.us" --source zh          # Mandarin
-langlistn --app "Microsoft Teams" --source fr  # French
+### Source language hints
 
-# Use microphone instead of app capture
-langlistn --mic
-langlistn --mic --source de                    # German speaker
-langlistn --mic --device "MacBook Pro Microphone"
+Auto-detection works well, but hinting improves accuracy for specific languages:
 
-# Discovery
-langlistn --list-apps       # Show capturable apps
-langlistn --list-devices    # Show audio input devices
+```bash
+./langlistn --app "Google Chrome" --source ko     # Korean
+./langlistn --app "Google Chrome" --source ja     # Japanese
+./langlistn --app "zoom.us" --source zh           # Mandarin
+./langlistn --app "Microsoft Teams" --source fr   # French
+./langlistn --app "zoom.us" --source de           # German
+./langlistn --app "Google Chrome" --source es     # Spanish
+```
 
-# Options
-langlistn --app "zoom.us" --transcript   # Show source-language transcript too
-langlistn --app "zoom.us" --log out.txt  # Save translations to file
-langlistn --app "zoom.us" --deployment my-gpt-realtime  # Custom deployment name
+<details>
+<summary>All supported language codes</summary>
+
+`ko` Korean · `ja` Japanese · `zh` Mandarin · `zh-yue` Cantonese · `th` Thai · `vi` Vietnamese · `fr` French · `de` German · `es` Spanish · `ar` Arabic · `hi` Hindi · `pt` Portuguese · `it` Italian · `ru` Russian · `id` Indonesian · `ms` Malay · `tl` Tagalog
+
+Auto-detects any language Whisper supports — these codes are hints, not requirements.
+</details>
+
+### Microphone capture
+
+```bash
+# Default microphone
+./langlistn --mic
+
+# Specific microphone
+./langlistn --mic --device "MacBook Pro Microphone"
+
+# Mic with language hint
+./langlistn --mic --source de
+```
+
+### Discovery
+
+```bash
+./langlistn --list-apps       # Show capturable apps (must be running)
+./langlistn --list-devices    # Show audio input devices
+```
+
+### Combining options
+
+```bash
+# Full example: Korean source, show original text, log to file
+./langlistn --app "Google Chrome" --source ko --transcript --log meeting.txt
+
+# Use the full model for higher quality
+./langlistn --app "Google Chrome" --deployment gpt-realtime
 ```
 
 ### TUI keybindings
@@ -108,67 +141,49 @@ langlistn --app "zoom.us" --deployment my-gpt-realtime  # Custom deployment name
 | Key | Action |
 |-----|--------|
 | `q` | Quit |
-| `t` | Toggle source-language transcript (Whisper output) |
+| `o` | Toggle original language text (Whisper transcription) |
 | `l` | Toggle file logging |
 | `c` | Clear display |
-| `^p` | Theme palette |
-
-### Supported languages
-
-Auto-detects any language Whisper supports. Use `--source` to hint for better accuracy:
-
-`ko` Korean · `ja` Japanese · `zh` Mandarin · `zh-yue` Cantonese · `th` Thai · `vi` Vietnamese · `fr` French · `de` German · `es` Spanish · `ar` Arabic · `hi` Hindi · `pt` Portuguese · `it` Italian · `ru` Russian · `id` Indonesian · `ms` Malay · `tl` Tagalog
+| `Ctrl+p` | Theme palette |
 
 ## Cost
 
-> **⚠️ Cost Warning**
->
-> langlistn streams audio to OpenAI's Realtime API, which bills per token. Expect roughly **$0.05–0.10/minute** depending on audio density and speech pace. A 1-hour listening session could cost **$3–6**. Costs are displayed in the status bar — monitor usage in your Azure/OpenAI dashboard.
-
-Pricing is based on gpt-4o-realtime rates (~$0.06/min audio input for voice-in/text-out).
+> **⚠️ Cost warning:** langlistn streams audio to OpenAI's Realtime API, which bills per token. With `gpt-realtime-mini` (default), expect roughly **$0.01–0.03/minute** — a 1-hour session costs **~$0.60–1.80**. The full `gpt-realtime` model is ~10× more expensive. Silence is detected client-side and not sent, which helps. Monitor costs in the status bar and your Azure dashboard.
 
 ## Troubleshooting
 
 | Problem | Fix |
 |---------|-----|
-| **No audio data / silence** | Check macOS permissions (both Screen Recording AND System Audio Recording). Restart your terminal after granting. |
-| **`AZURE_OPENAI_API_KEY not set`** | Copy `.env.example` to `.env` and fill in your key, or `export` it. |
+| **No audio / silence** | Grant both permissions in System Settings (Screen Recording AND System Audio Recording). Restart terminal. |
+| **`AZURE_OPENAI_API_KEY not set`** | Add to `.env` or export in your shell. |
 | **`OPENAI_API_BASE not set`** | Set your Azure endpoint URL in `.env` or environment. |
-| **Swift build fails** | Ensure Xcode Command Line Tools are installed: `xcode-select --install` |
-| **App not in `--list-apps`** | The app must be running and have an active audio session. |
+| **`API key rejected`** | Verify key and endpoint in Azure OpenAI Studio. |
+| **Swift build fails** | Install Xcode Command Line Tools: `xcode-select --install` |
+| **First run seems stuck** | Swift compilation takes ~30s on first launch. Subsequent runs are instant. |
+| **App not in `--list-apps`** | The app must be running and producing audio. |
 | **Mic permission denied** | Grant microphone access to your terminal in System Settings → Privacy & Security → Microphone. |
-| **`reconnect failed after 10 attempts`** | Check your API key, endpoint URL, and deployment name. Verify the deployment is active in Azure OpenAI Studio. |
-
-## Requirements
-
-- **macOS 15+** (ScreenCaptureKit audio capture)
-- **Python 3.11+**
-- **Swift toolchain** (Xcode or Command Line Tools — `xcode-select --install`)
-- **Azure OpenAI** with a `gpt-4o-realtime-preview` deployment
+| **Reconnect loop** | Check API key, endpoint URL, and deployment name. Verify deployment is active. |
 
 ## Project structure
 
 ```
 langlistn/
-├── langlistn               # Shell wrapper (venv + Swift build + exec)
+├── langlistn               # Shell wrapper (auto-builds venv + Swift)
 ├── pyproject.toml
-├── .env.example            # Configuration template
-├── LICENSE                 # MIT
+├── .env.example
 ├── src/langlistn/
-│   ├── __main__.py         # CLI (argparse)
+│   ├── __main__.py         # CLI entry point
 │   ├── app.py              # Async orchestrator
-│   ├── config.py           # System prompt, language map, constants
+│   ├── config.py           # Prompts, languages, constants
 │   ├── audio/
-│   │   ├── __init__.py     # AppCapture (ScreenCaptureKit via Swift helper)
-│   │   └── mic_capture.py  # MicCapture (sounddevice)
+│   │   ├── __init__.py     # App capture (ScreenCaptureKit)
+│   │   └── mic_capture.py  # Mic capture (sounddevice)
 │   ├── realtime/
-│   │   └── __init__.py     # OpenAI Realtime API WebSocket session
+│   │   └── __init__.py     # OpenAI Realtime API session
 │   └── tui/
-│       └── __init__.py     # Textual app, LiveText streaming widget
+│       └── __init__.py     # Terminal UI (Textual)
 └── swift/
-    └── AudioCaptureHelper/ # Swift Package — ScreenCaptureKit capture
-        ├── Package.swift
-        └── Sources/main.swift
+    └── AudioCaptureHelper/ # Swift ScreenCaptureKit helper
 ```
 
 ## License

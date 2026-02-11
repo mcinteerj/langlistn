@@ -4,13 +4,17 @@ import argparse
 import asyncio
 import json
 
+from dotenv import load_dotenv
+
 from . import __version__
 
 
 def main():
+    load_dotenv()
+
     parser = argparse.ArgumentParser(
         prog="langlistn",
-        description="Real-time audio translation and transcription to English.",
+        description="Real-time audio translation to English.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 examples:
@@ -35,7 +39,7 @@ examples:
 
 environment variables:
   AZURE_OPENAI_API_KEY     Azure OpenAI API key
-  OPENAI_API_BASE          Azure OpenAI endpoint URL (optional override)
+  OPENAI_API_BASE          Azure OpenAI endpoint URL
 """,
     )
 
@@ -52,12 +56,10 @@ environment variables:
     parser.add_argument("--device", metavar="NAME", help="Microphone device name (with --mic)")
     parser.add_argument("--source", metavar="CODE", dest="lang",
                         help="Source language hint (ISO 639-1, e.g. ko, ja, zh). Auto-detected if omitted.")
-    parser.add_argument("--target", metavar="CODE", default="en",
-                        help="Target language (default: en). Currently only English supported.")
     parser.add_argument("--transcript", action="store_true", help="Show source-language transcript")
     parser.add_argument("--log", metavar="FILE", help="Save translations to file")
-    parser.add_argument("--deployment", metavar="NAME", default="gpt-realtime",
-                        help="Azure OpenAI deployment name (default: gpt-realtime)")
+    parser.add_argument("--deployment", metavar="NAME", default="gpt-realtime-mini",
+                        help="Azure OpenAI deployment name (default: gpt-realtime-mini)")
     parser.add_argument("--json", dest="output_json", action="store_true", help="JSON output (for --list-*)")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
 

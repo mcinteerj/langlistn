@@ -1,8 +1,10 @@
 """Main async orchestrator — ties audio, realtime API, and TUI together."""
 
+from __future__ import annotations
+
 import asyncio
 
-from .audio import AppCapture
+from .audio import AppCapture, AudioSource
 from .audio.mic_capture import MicCapture
 from .realtime import RealtimeSession
 from .tui import TranslateApp
@@ -13,7 +15,7 @@ async def run_app(
     mic: bool = False,
     device: str | None = None,
     lang: str | None = None,
-    deployment: str = "gpt-realtime",
+    deployment: str = "gpt-realtime-mini",
     log_path: str | None = None,
     show_transcript: bool = False,
 ) -> None:
@@ -22,6 +24,7 @@ async def run_app(
     lang_name = resolve_language_name(lang)
 
     # Build audio source
+    source: AudioSource
     if app_name:
         source = AppCapture(app_name)
         mode = f"app: {app_name}"
@@ -44,6 +47,6 @@ async def run_app(
         audio_source=source,
     )
     if show_transcript:
-        tui._show_transcript = True
+        tui._show_original = True
 
     await tui.run_async()
