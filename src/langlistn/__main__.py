@@ -84,7 +84,7 @@ def _pick(prompt: str, options: list[str], default: int = 0) -> str:
     """Simple interactive picker. Returns selected option."""
     print(f"\n{prompt}")
     for i, opt in enumerate(options):
-        marker = "→" if i == default else " "
+        marker = "*" if i == default else " "
         print(f"  {marker} [{i + 1}] {opt}")
     while True:
         try:

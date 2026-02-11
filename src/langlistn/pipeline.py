@@ -198,12 +198,15 @@ async def run_pipeline(
             sys.stderr.write(f"Warning: could not open log file: {e}\n")
 
     # Start audio
-    display.update("", "", "starting audio capture...")
+    sys.stdout.write(f"  starting audio capture...\r")
+    sys.stdout.flush()
     try:
         await source.start()
     except Exception as e:
         sys.stderr.write(f"\nAudio capture failed: {e}\n")
         return
+    sys.stdout.write(f"\033[2K\r")
+    sys.stdout.flush()
 
     # Speaker diarization (optional)
     speaker_tracker = SpeakerTracker() if cfg.diarize else None
