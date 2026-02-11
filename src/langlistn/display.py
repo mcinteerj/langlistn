@@ -38,7 +38,7 @@ def _visible_len(s: str) -> int:
     return len(_ANSI_RE.sub('', s))
 
 # Sentence-ending punctuation pattern
-_SENTENCE_END = re.compile(r'([.!?。！？…])\s+')
+_SENTENCE_END = re.compile(r'([.!?。！？…]\s+)')
 
 PARAGRAPH_INTERVAL = 3  # Insert blank line every N sentences
 
@@ -131,6 +131,7 @@ class TerminalDisplay:
         self.width = shutil.get_terminal_size().columns
         self.plain = plain
         self._permanent_lines = 0     # lines we've permanently printed
+        self._permanent_content: list[str] = []  # content of each permanent line
         self._erasable_lines = 0      # lines in the erasable zone
         self._last_locked = ""
 
@@ -157,20 +158,47 @@ class TerminalDisplay:
         locked_lines = _wrap_lines(locked_formatted, w) if locked_formatted else []
         total_locked = len(locked_lines)
 
-        # Permanent zone: all locked lines except the last (which is erasable
-        # so speculative can continue on the same line)
-        new_permanent_target = max(0, total_locked - 1)
+        # Permanent zone: locked lines that are safe to commit (can't be erased).
+        # Keep a buffer of recent locked lines erasable to absorb word-wrap
+        # changes when the LLM revises text. Only commit lines whose content
+        # matches what we previously rendered — this prevents duplicates when
+        # re-wrapping shifts line boundaries.
+        ERASABLE_LOCKED_BUFFER = 3  # keep last N locked lines erasable
+        new_permanent_target = max(0, total_locked - ERASABLE_LOCKED_BUFFER)
 
-        # Print any new permanent lines
+        # Only advance if new lines match what we'd print
+        # (prevents committing lines that might re-wrap differently next update)
+        safe_target = self._permanent_lines
         for i in range(self._permanent_lines, new_permanent_target):
-            sys.stdout.write(f"{BOLD}{locked_lines[i]}{RESET}\n")
-        self._permanent_lines = new_permanent_target
+            # Check this line matches what was in the erasable zone last frame
+            if i < len(self._permanent_content) and \
+               self._permanent_content[i] == locked_lines[i]:
+                safe_target = i + 1
+            elif i >= len(self._permanent_content):
+                # New line not seen before — commit it and record
+                safe_target = i + 1
+            else:
+                # Content changed — stop advancing
+                break
 
-        # Build erasable zone: last locked line + speculative + status
+        for i in range(self._permanent_lines, safe_target):
+            sys.stdout.write(f"{BOLD}{locked_lines[i]}{RESET}\n")
+        self._permanent_lines = safe_target
+        # Record what locked lines look like for next comparison
+        self._permanent_content = list(locked_lines[:total_locked])
+
+        # Build erasable zone: buffered locked lines + speculative + status
         erasable_count = 0
 
-        if locked_lines:
-            last_locked_line = locked_lines[-1]
+        # Render non-permanent locked lines (erasable buffer)
+        erasable_locked = locked_lines[self._permanent_lines:]
+        if erasable_locked:
+            # All but last erasable locked line
+            for line in erasable_locked[:-1]:
+                sys.stdout.write(f"{BOLD}{line}{RESET}\n")
+                erasable_count += 1
+
+            last_locked_line = erasable_locked[-1]
             if speculative.strip():
                 # Render last locked line bold, then speculative continues
                 # on the same line in dim italic
@@ -225,24 +253,28 @@ class TerminalDisplay:
         if self.plain:
             return
         w = self.width
-        lang_display = f"{lang} → English" if lang else "auto → English"
+        lang_display = f"{lang} > English" if lang else "auto > English"
         model_short = model.split("/")[-1] if "/" in model else model
-        t_tag = f" · {translate_model}" if translate_model else ""
-        info = f"{lang_display} · {mode} · {model_short}{t_tag}"
+        t_tag = f" / {translate_model}" if translate_model else ""
+        info = f"{lang_display} / {mode} / {model_short}{t_tag}"
         hint = "Ctrl+C to stop"
 
         # Top border
         title = " langlistn "
         pad = w - len(title) - 3
         sys.stdout.write(f"\n {DIM}┌{RESET}{BOLD}{title}{RESET}{DIM}{'─' * max(pad, 0)}┐{RESET}\n")
-        # Info line
-        inner_w = w - 4
+        # Info line: " │ {info padded} · {hint} │"
+        # Must be same visible width as borders: w chars total
+        # " │" = 2, "│" = 1 → inner = w - 3 chars between the │ bars
+        inner_w = w - 3
         if w >= 50:
-            info_space = inner_w - len(hint) - 2
-            info_trimmed = info[:info_space].ljust(info_space)
-            sys.stdout.write(f" {DIM}│{RESET} {info_trimmed}{DIM}{hint}{RESET} {DIM}│{RESET}\n")
+            # " {info...} · {hint} " — with leading and trailing space
+            right = f" | {hint} "
+            left_w = inner_w - len(right)
+            left = f" {info[:left_w - 1].ljust(left_w - 1)}"
+            sys.stdout.write(f" {DIM}│{RESET}{left}{DIM}{right}│{RESET}\n")
         else:
-            sys.stdout.write(f" {DIM}│{RESET} {info[:inner_w].ljust(inner_w)} {DIM}│{RESET}\n")
+            sys.stdout.write(f" {DIM}│{RESET} {info[:inner_w - 2].ljust(inner_w - 2)} {DIM}│{RESET}\n")
         # Bottom border
         sys.stdout.write(f" {DIM}└{'─' * (w - 3)}┘{RESET}\n\n")
         sys.stdout.flush()
@@ -252,8 +284,8 @@ class TerminalDisplay:
         self._erase()
         if self.plain:
             return
-        w = min(40, self.width - 2)
-        inner = w - 4  # space between "│  " and "  │"
+        inner = min(36, self.width - 6)  # content width inside box
+        # Box total visible width = inner + 6 (│ + 2 padding each side + │)
 
         def _row(label: str, value: str) -> str:
             content = f"{label}{value}"
@@ -264,7 +296,9 @@ class TerminalDisplay:
         cost_str = f"${cost:.3f}" if cost > 0 else ""
         calls_val = f"{llm_calls} · {cost_str}" if cost_str else str(llm_calls)
 
-        sys.stdout.write(f"\n {DIM}╭─{RESET}{BOLD} session summary {RESET}{DIM}{'─' * max(0, w - 20)}╮{RESET}\n")
+        title = " session summary "
+        top_dashes = inner + 4 - len(title) - 1  # +4 for padding, -1 for leading ─
+        sys.stdout.write(f"\n {DIM}╭─{RESET}{BOLD}{title}{RESET}{DIM}{'─' * max(0, top_dashes)}╮{RESET}\n")
         sys.stdout.write(_row("Duration     ", dur_str))
         if words:
             sys.stdout.write(_row("Words        ", str(words)))
@@ -272,5 +306,5 @@ class TerminalDisplay:
             sys.stdout.write(_row("Sentences    ", str(sentences)))
         if llm_calls:
             sys.stdout.write(_row("LLM calls    ", calls_val))
-        sys.stdout.write(f" {DIM}╰{'─' * (w - 2)}╯{RESET}\n\n")
+        sys.stdout.write(f" {DIM}╰{'─' * (inner + 4)}╯{RESET}\n\n")
         sys.stdout.flush()

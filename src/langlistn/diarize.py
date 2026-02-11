@@ -10,10 +10,18 @@ MLX whisper which uses ANE/GPU.
 """
 
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 
 import numpy as np
+
+# Suppress OMP deprecation/info messages (C-level, can't be caught by Python)
+os.environ.setdefault("KMP_WARNINGS", "0")
+os.environ.setdefault("OMP_DISPLAY_ENV", "FALSE")
+# Prevent omp_set_nested deprecation info message
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+os.environ.setdefault("KMP_INIT_AT_FORK", "FALSE")
 
 logger = logging.getLogger(__name__)
 
@@ -50,22 +58,29 @@ class SpeakerTracker:
     _buffer_offset: float = field(default=0.0)
     _last_process_time: float = field(default=0.0)
     _available: bool = field(default=False)
+    _first_run: bool = field(default=True)
 
     def load(self) -> bool:
         """Load diart pipeline. Returns False if diart not installed."""
         try:
-            from diart import SpeakerDiarization
-            from diart.inference import StreamingInference
+            from diart import SpeakerDiarization, SpeakerDiarizationConfig
+            from diart.models import SegmentationModel, EmbeddingModel
             import torch
 
-            config = SpeakerDiarization(
+            seg = SegmentationModel.from_pyannote("pyannote/segmentation-3.0")
+            emb = EmbeddingModel.from_pyannote("pyannote/wespeaker-voxceleb-resnet34-LM")
+            cfg = SpeakerDiarizationConfig(
+                segmentation=seg,
+                embedding=emb,
                 step=self.step_seconds,
                 latency=self.latency_seconds,
                 tau_active=0.5,
                 rho_update=0.3,
                 delta_new=1.0,
                 device=torch.device("cpu"),
+                sample_rate=SAMPLE_RATE,
             )
+            config = SpeakerDiarization(cfg)
             self._pipeline = config
             self._available = True
             logger.info(
@@ -100,6 +115,7 @@ class SpeakerTracker:
         buf_secs = len(self._audio_buffer) / SAMPLE_RATE
         if buf_secs < self.latency_seconds:
             return []
+        logger.debug("Diarization process: buf=%.1fs", buf_secs)
 
         now = time.time()
         if now - self._last_process_time < self.step_seconds:
@@ -107,35 +123,61 @@ class SpeakerTracker:
         self._last_process_time = now
 
         try:
+            # First run triggers OMP C-level messages — suppress via fd redirect
+            if self._first_run:
+                self._first_run = False
+                old_fd = os.dup(2)
+                devnull = os.open(os.devnull, os.O_WRONLY)
+                os.dup2(devnull, 2)
+                os.close(devnull)
+                try:
+                    return self._run_diarization()
+                finally:
+                    os.dup2(old_fd, 2)
+                    os.close(old_fd)
             return self._run_diarization()
         except Exception as e:
             logger.warning("Diarization error: %s", e)
             return []
 
     def _run_diarization(self) -> list[SpeakerSegment]:
-        """Run diart on current buffer window."""
-        import torch
-        from diart import SpeakerDiarization
-        from diart.blocks import BasePipeline
+        """Run diart on current buffer window using SlidingWindowFeature."""
+        from pyannote.core import SlidingWindow, SlidingWindowFeature
 
-        # Build a waveform tensor: (channels=1, samples)
-        waveform = torch.from_numpy(self._audio_buffer).unsqueeze(0).float()
+        # Build a SlidingWindowFeature for the current buffer chunk
+        # diart expects duration-sized chunks (latency_seconds)
+        duration = self.latency_seconds
+        step_samples = int(duration * SAMPLE_RATE)
 
-        # Run the pipeline directly on the waveform
-        pipeline: SpeakerDiarization = self._pipeline
-        output = pipeline(waveform, SAMPLE_RATE)
+        # Extract the latest chunk (step_seconds worth of audio)
+        if len(self._audio_buffer) < step_samples:
+            return []
 
-        # output is an Annotation — iterate turns
+        chunk = self._audio_buffer[-step_samples:]
+        # SlidingWindowFeature: (num_samples, 1) with timing info
+        waveform = SlidingWindowFeature(
+            chunk.reshape(-1, 1),
+            SlidingWindow(
+                start=self._buffer_offset + (len(self._audio_buffer) - step_samples) / SAMPLE_RATE,
+                duration=1 / SAMPLE_RATE,
+                step=1 / SAMPLE_RATE,
+            ),
+        )
+
+        pipeline = self._pipeline
+        results = pipeline([waveform])
         new_segments = []
-        if output is not None:
-            for segment, _, label in output.itertracks(yield_label=True):
-                speaker_name = self._map_speaker(str(label))
-                seg = SpeakerSegment(
-                    speaker=speaker_name,
-                    start=self._buffer_offset + segment.start,
-                    end=self._buffer_offset + segment.end,
-                )
-                new_segments.append(seg)
+        if results:
+            for annotation, _ in results:
+                if annotation is not None:
+                    for segment, _, label in annotation.itertracks(yield_label=True):
+                        speaker_name = self._map_speaker(str(label))
+                        seg = SpeakerSegment(
+                            speaker=speaker_name,
+                            start=segment.start,
+                            end=segment.end,
+                        )
+                        new_segments.append(seg)
 
         # Trim buffer: keep last latency_seconds
         keep_samples = int(self.latency_seconds * SAMPLE_RATE)
@@ -145,8 +187,9 @@ class SpeakerTracker:
             self._audio_buffer = self._audio_buffer[trim:]
 
         if new_segments:
+            speakers = {s.speaker for s in new_segments}
+            logger.debug("Diarization: %d segments, speakers=%s", len(new_segments), speakers)
             self._segments.extend(new_segments)
-            # Keep only last 60s of segments
             cutoff = self._buffer_offset - 60
             self._segments = [s for s in self._segments if s.end > cutoff]
 

@@ -127,15 +127,6 @@ def _is_hallucination(text: str) -> bool:
     return False
 
 
-def _looks_english(text: str) -> bool:
-    if not text.strip():
-        return True
-    ascii_letters = sum(1 for c in text if c.isascii() and c.isalpha())
-    all_letters = sum(1 for c in text if c.isalpha())
-    if all_letters == 0:
-        return True
-    return (ascii_letters / all_letters) > 0.8
-
 
 def _offer_transcript_save(text: str, start_time: float):
     """Prompt user to save transcript to Desktop."""
@@ -236,17 +227,29 @@ async def run_pipeline(
 
     def _load():
         nonlocal load_error, vad_model
-        try:
-            asr.load()
-            vad_model = _load_vad()
-            logger.info("VAD model loaded")
-            if speaker_tracker:
-                if not speaker_tracker.load():
-                    logger.warning("Diarization unavailable — continuing without")
-        except Exception as e:
-            load_error = e
-        finally:
-            loop.call_soon_threadsafe(load_done.set)
+        import warnings
+        import os
+        # Suppress noisy warnings from torch/torchaudio/pyannote/OMP during load
+        # Must redirect C-level fd 2 to catch OMP info messages
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            old_stderr_fd = os.dup(2)
+            devnull_fd = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull_fd, 2)
+            os.close(devnull_fd)
+            try:
+                asr.load()
+                vad_model = _load_vad()
+                logger.info("VAD model loaded")
+                if speaker_tracker:
+                    if not speaker_tracker.load():
+                        logger.warning("Diarization unavailable — continuing without")
+            except Exception as e:
+                load_error = e
+            finally:
+                os.dup2(old_stderr_fd, 2)
+                os.close(old_stderr_fd)
+                loop.call_soon_threadsafe(load_done.set)
 
     threading.Thread(target=_load, daemon=True).start()
     await load_done.wait()
@@ -262,6 +265,7 @@ async def run_pipeline(
 
     # ── shared state ──
     confirmed_source = ""
+    confirmed_display = ""  # accumulated display text (survives silence resets)
     speculative_source = ""
     last_speech_time = time.time()
     whisper_lock = asyncio.Lock()
@@ -304,9 +308,10 @@ async def run_pipeline(
                 speaker_tracker.feed_audio(samples)
 
     async def transcribe_and_translate():
-        nonlocal confirmed_source, speculative_source
+        nonlocal confirmed_source, confirmed_display, speculative_source
         nonlocal windows_processed, processing_time_total
         nonlocal silence_reset_done, consecutive_timeouts, consecutive_hallucinations
+        nonlocal prev_speaker
 
         # Wait for initial audio
         while not shutdown.is_set():
@@ -326,28 +331,36 @@ async def run_pipeline(
             # ── silence detection ──
             silence_duration = time.time() - last_speech_time
             if silence_duration > cfg.silence_reset_seconds:
-                if not silence_reset_done and translator:
-                    # Promote any remaining speculative to confirmed before reset
-                    if translator.speculative_translation:
-                        translator.confirmed_translation = (
-                            (translator.confirmed_translation + " " + translator.speculative_translation)
-                            .strip()
-                        )
-                        translator.speculative_translation = ""
-                        full = translator.confirmed_translation
-                        display.update(full, "", "silence — context locked")
-                    translator._last_full_output = ""
+                if not silence_reset_done:
+                    if translator:
+                        # Promote any remaining speculative to confirmed before reset
+                        if translator.speculative_translation:
+                            translator.confirmed_translation = (
+                                (translator.confirmed_translation + " " + translator.speculative_translation)
+                                .strip()
+                            )
+                            translator.speculative_translation = ""
+                            full = translator.confirmed_translation
+                            display.update(full, "", "silence — context locked")
+                        translator._last_full_output = ""
+                    else:
+                        # No-translate: promote source text to display baseline
+                        confirmed_display += (" " + confirmed_source if confirmed_display else confirmed_source)
+                        confirmed_display = confirmed_display.strip()
                     confirmed_source = ""
                     silence_reset_done = True
                 if buf_seconds < cfg.min_audio_seconds:
-                    locked_text = translator.confirmed_translation if translator else confirmed_source
+                    locked_text = translator.confirmed_translation if translator else confirmed_display
                     display.update(locked_text, "", _build_status())
                     continue
             else:
                 silence_reset_done = False
 
             if buf_seconds < cfg.min_audio_seconds:
-                locked_text = translator.confirmed_translation if translator else confirmed_source
+                if translator:
+                    locked_text = translator.confirmed_translation
+                else:
+                    locked_text = (confirmed_display + " " + confirmed_source).strip() if confirmed_source else confirmed_display
                 display.update(locked_text, "", _build_status())
                 continue
 
@@ -440,7 +453,7 @@ async def run_pipeline(
                 if confirmed:
                     # Speaker change detection — inject coloured tag
                     if speaker_tracker and speaker_tracker.available:
-                        speaker_tracker.process()
+                        await loop.run_in_executor(None, speaker_tracker.process)
                         cur = speaker_tracker.current_speaker()
                         if cur and cur != prev_speaker:
                             if cur not in speaker_colour_map:
@@ -459,10 +472,7 @@ async def run_pipeline(
                     full_source += " " + speculative_source
 
                 if not translator or not full_source.strip():
-                    locked = confirmed_source
-                    spec = speculative_source
-                elif _looks_english(full_source):
-                    locked = confirmed_source
+                    locked = (confirmed_display + " " + confirmed_source).strip() if confirmed_source else confirmed_display
                     spec = speculative_source
                 elif confirmed or (cfg.translate_on_every_cycle and speculative_source):
                     # Only call LLM when there's new confirmed or new speculative
@@ -484,8 +494,9 @@ async def run_pipeline(
                     spec = translator.speculative_translation
 
             # ── diarization (keep warm even without confirmed text) ──
+            # Run in executor to avoid blocking the event loop
             if speaker_tracker and speaker_tracker.available and not confirmed:
-                speaker_tracker.process()
+                await loop.run_in_executor(None, speaker_tracker.process)
 
             # ── display ──
             avg_ms = (
@@ -523,32 +534,33 @@ async def run_pipeline(
             confirmed_source += (" " + remaining if confirmed_source else remaining)
 
         full_final = ""
-        if translator and confirmed_source.strip() and not _looks_english(confirmed_source):
+        all_source = (confirmed_display + " " + confirmed_source).strip()
+        if translator and all_source:
             try:
-                locked, spec = translator.translate(confirmed_source)
+                locked, spec = translator.translate(all_source)
                 full_final = (locked + " " + spec).strip()
                 display.update(full_final, "")
             except Exception:
-                full_final = confirmed_source
-                display.update(confirmed_source, "")
-        elif confirmed_source.strip():
-            full_final = confirmed_source
-            display.update(confirmed_source, "")
+                full_final = translator.confirmed_translation or all_source
+                display.update(full_final, "")
+        elif all_source:
+            full_final = all_source
+            display.update(all_source, "")
 
         duration = time.time() - start_time
         cost = translator.estimated_cost() if translator else 0.0
-        final_text = full_final or confirmed_source
+        final_text = full_final or all_source
         word_count = len(final_text.split()) if final_text.strip() else 0
         sentence_count = sum(final_text.count(p) for p in '.!?。！？') if final_text.strip() else 0
         llm_calls = translator.calls if translator else 0
         display.finish(
             duration=duration, words=word_count, sentences=sentence_count,
             llm_calls=llm_calls, cost=cost,
-            has_content=bool(confirmed_source.strip()),
+            has_content=bool(all_source),
         )
 
         # Offer transcript save
-        if confirmed_source.strip() and not plain and final_text.strip():
+        if all_source and not plain and final_text.strip():
             _offer_transcript_save(final_text, start_time)
 
         await source.stop()
