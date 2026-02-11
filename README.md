@@ -25,37 +25,45 @@ Two-zone terminal (bold = confirmed, dim italic = speculative)
 ### Two confidence loops
 
 ```
-┌─────────────────────────────────────────────┐
-│  TRANSCRIPTION LOOP (~1-2s cycle)           │
-│                                             │
-│  Audio chunks                               │
-│    → Silero VAD (discard non-speech)        │
-│    → mlx-whisper transcribe                 │
-│      init_prompt = prior confirmed text     │
-│    → LocalAgreement-2 → confirmed source    │
-│                                             │
-│  Speculative: current whisper hypothesis    │
-│  Confirmed: agreed by 2 consecutive runs    │
-└──────────────┬──────────────────────────────┘
+┌──────────────────────────────────────────────────┐
+│  TRANSCRIPTION LOOP (~1-2s cycle)                │
+│                                                  │
+│  Audio chunks                                    │
+│    → Silero VAD (discard non-speech)             │
+│    → mlx-whisper transcribe (25s buffer)         │
+│      init_prompt = prior confirmed text          │
+│    → LocalAgreement-2 → confirmed source         │
+│    → stash last 3 speculative hypotheses         │
+│                                                  │
+│  Speculative: current whisper hypothesis         │
+│  Confirmed: agreed by 2 consecutive runs         │
+└──────────────┬───────────────────────────────────┘
                ↓
-┌─────────────────────────────────────────────┐
-│  TRANSLATION LOOP (on every whisper cycle)  │
-│                                             │
-│  Prompt to Claude:                          │
-│    "Korean transcript: {full_source}"       │
-│    "Reference translation: {confirmed_en}"  │
-│    "Produce full updated translation"       │
-│                                             │
-│  Confirmation:                              │
-│    Compare against last 4 LLM outputs       │
-│    Lock at word/sentence boundary            │
-│    Force-lock after 3 unstable cycles       │
-│                                             │
-│  confirmed_en fed back as reference ──────┐ │
-└──────────────┬────────────────────────────┘ │
-               ↓                     ↑        │
-        Terminal display             └────────┘
+┌──────────────────────────────────────────────────┐
+│  TRANSLATION LOOP (on every whisper cycle)       │
+│                                                  │
+│  Prompt to Claude:                               │
+│    "Korean transcript: {full_source}"            │
+│    "Alt transcriptions: {recent hypotheses}"     │
+│    "Reference translation: {confirmed_en}"       │
+│    "Produce full updated translation"            │
+│                                                  │
+│  Confirmation:                                   │
+│    Compare against last 4 LLM outputs            │
+│    Lock at word/sentence boundary                │
+│    Force-lock after 3 unstable cycles            │
+│                                                  │
+│  confirmed_en fed back as reference ───────────┐ │
+└──────────────┬─────────────────────────────────┘ │
+               ↓                          ↑       │
+        Terminal display                  └───────┘
         bold = locked, dim italic = live tail
+
+  ┌─ OPTIONAL ──────────────────────────────────┐
+  │  DIARIZATION (parallel, --diarize)          │
+  │  Same audio → diart (pyannote on CPU)       │
+  │  → Speaker A/B/C labels in status bar       │
+  └─────────────────────────────────────────────┘
 ```
 
 Audio is captured per-app via ScreenCaptureKit. Non-speech audio (music, silence) is filtered by Silero VAD before reaching Whisper. Whisper transcribes in the source language using a growing buffer with LocalAgreement-2 — text is confirmed only when two consecutive runs agree. The full source transcript and confirmed English are sent to Claude, which produces an updated translation. Translation is confirmed by diffing consecutive LLM outputs — stable prefixes are locked and fed back as context.
@@ -132,6 +140,19 @@ langlistn --app "zoom.us" --source ko --translate-model opus    # best quality
 | `sonnet` | ~500ms | ~$1.00 | Important conversations |
 | `opus` | ~800ms | ~$5.00 | Maximum accuracy |
 
+### Speaker diarization
+
+Identify different speakers in the audio (requires extra install):
+
+```bash
+pip install langlistn[diarize]
+langlistn --app "zoom.us" --source ko --diarize
+```
+
+Uses [diart](https://github.com/juanmc2005/diart) (pyannote-based streaming diarization). Runs on CPU alongside Whisper on ANE/GPU — no resource conflict. Speakers are labelled A, B, C, etc. in the status bar.
+
+> **Note**: First run downloads pyannote models (~500MB). Requires accepting the [pyannote model license](https://huggingface.co/pyannote/segmentation-3.0) on HuggingFace.
+
 ### Transcribe only (no translation)
 
 ```bash
@@ -188,6 +209,9 @@ langlistn --list-devices    # Show audio input devices
 - **Continuation-based translation**: Each Claude call gets the full source transcript + confirmed English as reference. The LLM produces a full updated translation, not just a continuation — this avoids overlap/duplication errors.
 - **Two-zone confirmation**: Translation is confirmed by diffing recent LLM outputs. Stable prefixes lock at word boundaries. Force-confirm after 3 unstable cycles prevents text from staying speculative forever.
 - **Ring buffer comparison**: Compares current LLM output against the last 4 outputs, not just the previous one. If outputs 1 and 3 agree (even though 2 differed), confirmation still fires.
+- **Multi-hypothesis translation**: Recent whisper speculative outputs (which may differ across runs) are fed to Claude as alternatives, helping disambiguate homophones and boundary-ambiguous words.
+- **25s audio buffer**: Whisper always processes a 30s spectrogram internally (shorter audio is zero-padded). Keeping 25s in the buffer maximises context for CJK languages where word boundaries are ambiguous.
+- **Optional speaker diarization**: diart (pyannote-based) runs on CPU alongside Whisper on ANE/GPU. No resource contention on Apple Silicon.
 
 ### Project structure
 
@@ -200,6 +224,7 @@ langlistn/
 │   ├── streaming_asr.py      # LocalAgreement-2 engine (from whisper_streaming)
 │   ├── translate.py          # Continuation-based Bedrock Claude translation
 │   ├── display.py            # Two-zone terminal renderer
+│   ├── diarize.py            # Speaker diarization via diart (optional)
 │   ├── config.py             # Languages, constants, model selection
 │   ├── audio/
 │   │   ├── __init__.py       # App capture (ScreenCaptureKit)
@@ -218,6 +243,7 @@ langlistn/
 | **App not in `--list-apps`** | The app must be running and producing audio. |
 | **Slow first run** | Model download (~3GB for large-v2). Cached after first run. |
 | **Hallucination loops** | Built-in VAD + hallucination detection. Try adding `--source` hint. |
+| **Diarization not working** | Install with `pip install langlistn[diarize]`. Accept pyannote model license on HuggingFace. |
 | **Intel Mac** | Not supported. mlx-whisper requires Apple Silicon (M1+). |
 
 ## License

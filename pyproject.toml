@@ -29,6 +29,11 @@ dependencies = [
     "silero-vad>=5.1",
 ]
 
+[project.optional-dependencies]
+diarize = [
+    "diart>=0.9",
+]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

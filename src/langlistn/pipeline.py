@@ -33,6 +33,7 @@ from .audio import AudioSource
 from .config import SILENCE_RMS_THRESHOLD
 from .display import TerminalDisplay
 from .streaming_asr import MLXWhisperASR, OnlineASRProcessor, SAMPLING_RATE
+from .diarize import SpeakerTracker
 from .translate import ContinuationTranslator
 
 
@@ -64,7 +65,7 @@ class PipelineConfig:
     # Transcription
     process_interval: float = 0.3
     min_audio_seconds: float = 1.0
-    buffer_trimming_sec: float = 15
+    buffer_trimming_sec: float = 25
     whisper_timeout: float = 8.0        # Kill whisper if it takes longer than this
 
     # Translation
@@ -77,6 +78,9 @@ class PipelineConfig:
 
     # Display
     dual_lang: bool = False
+
+    # Diarization
+    diarize: bool = False
 
 
 def _rms_int16(chunk: bytes) -> float:
@@ -187,8 +191,14 @@ async def run_pipeline(
         sys.stderr.write(f"\nAudio capture failed: {e}\n")
         return
 
-    # Load whisper model + VAD
-    display.update("", "", f"loading {model_name} + VAD...")
+    # Speaker diarization (optional)
+    speaker_tracker = SpeakerTracker() if cfg.diarize else None
+
+    # Load whisper model + VAD + diarization
+    loading_msg = f"loading {model_name} + VAD"
+    if speaker_tracker:
+        loading_msg += " + diarization"
+    display.update("", "", loading_msg + "...")
     loop = asyncio.get_running_loop()
     load_done = asyncio.Event()
     load_error = None
@@ -200,6 +210,9 @@ async def run_pipeline(
             asr.load()
             vad_model = _load_vad()
             logger.info("VAD model loaded")
+            if speaker_tracker:
+                if not speaker_tracker.load():
+                    logger.warning("Diarization unavailable — continuing without")
         except Exception as e:
             load_error = e
         finally:
@@ -226,6 +239,7 @@ async def run_pipeline(
     silence_reset_done = False  # prevents repeated resets
     consecutive_timeouts = 0
     consecutive_hallucinations = 0  # track whisper hallucination streaks
+    recent_whisper_hypotheses: list[str] = []  # last N raw whisper speculative outputs
 
     async def audio_loop():
         nonlocal last_speech_time
@@ -243,6 +257,8 @@ async def run_pipeline(
                     continue
             last_speech_time = time.time()
             processor.insert_audio_chunk(samples)
+            if speaker_tracker and speaker_tracker.available:
+                speaker_tracker.feed_audio(samples)
 
     async def transcribe_and_translate():
         nonlocal confirmed_source, speculative_source
@@ -357,6 +373,13 @@ async def run_pipeline(
                     speculative_source = ""
                     is_halluc = True
 
+                # Stash raw whisper hypothesis for multi-hypothesis LLM feeding
+                raw_hyp = processor.get_speculative()
+                if raw_hyp and not _is_hallucination(raw_hyp):
+                    recent_whisper_hypotheses.append(raw_hyp)
+                    if len(recent_whisper_hypotheses) > 3:
+                        recent_whisper_hypotheses.pop(0)
+
                 # Track consecutive hallucinations — reset processor if stuck
                 if is_halluc and not confirmed:
                     consecutive_hallucinations += 1
@@ -388,9 +411,15 @@ async def run_pipeline(
                     spec = speculative_source
                 elif confirmed or (cfg.translate_on_every_cycle and speculative_source):
                     # Only call LLM when there's new confirmed or new speculative
+                    # Feed alternative whisper hypotheses for disambiguation
+                    alt_hypotheses = [
+                        h for h in recent_whisper_hypotheses[:-1]
+                        if h != speculative_source
+                    ][-2:]  # max 2 alternatives
+
                     try:
                         locked, spec = await loop.run_in_executor(
-                            None, translator.translate, full_source
+                            None, translator.translate, full_source, alt_hypotheses
                         )
                     except Exception:
                         locked = translator.confirmed_translation
@@ -398,6 +427,14 @@ async def run_pipeline(
                 else:
                     locked = translator.confirmed_translation
                     spec = translator.speculative_translation
+
+            # ── diarization ──
+            speaker_label = ""
+            if speaker_tracker and speaker_tracker.available:
+                speaker_tracker.process()
+                cur = speaker_tracker.current_speaker()
+                if cur:
+                    speaker_label = f"[{cur}] "
 
             # ── display ──
             runtime = int(time.time() - start_time)
@@ -408,7 +445,7 @@ async def run_pipeline(
             )
             cost_str = f"${translator.estimated_cost():.3f}" if translator else "$0.00"
             status = (
-                f"listening · windows: {windows_processed} · "
+                f"{speaker_label}listening · windows: {windows_processed} · "
                 f"avg: {avg_ms:.0f}ms · buf: {buf_seconds:.0f}s · "
                 f"{runtime // 60}:{runtime % 60:02d} · {cost_str}"
             )

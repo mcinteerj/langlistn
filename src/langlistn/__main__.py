@@ -16,10 +16,29 @@ import asyncio
 import json
 import logging
 import sys
+from pathlib import Path
 
 from dotenv import load_dotenv
 
 from . import __version__
+
+_CONFIG_DIR = Path.home() / ".config" / "langlistn"
+_LAST_SESSION = _CONFIG_DIR / "last.json"
+
+
+def _load_last_session() -> dict:
+    try:
+        return json.loads(_LAST_SESSION.read_text())
+    except Exception:
+        return {}
+
+
+def _save_last_session(data: dict):
+    try:
+        _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        _LAST_SESSION.write_text(json.dumps(data))
+    except Exception:
+        pass
 
 
 def _pick(prompt: str, options: list[str], default: int = 0) -> str:
@@ -39,6 +58,62 @@ def _pick(prompt: str, options: list[str], default: int = 0) -> str:
         except (ValueError, EOFError):
             pass
         print(f"  Enter 1-{len(options)}")
+
+
+def _pick_app(apps: list[str]) -> str:
+    """Type-to-filter app picker with last-used memory."""
+    last = _load_last_session()
+    last_app = last.get("app")
+
+    # Reorder: last-used first if still available
+    if last_app and last_app in apps:
+        apps = [last_app] + [a for a in apps if a != last_app]
+
+    print("\n  Choose app (type to filter, Enter to select):")
+    filtered = apps
+    query = ""
+
+    while True:
+        # Show current matches
+        shown = filtered[:15]
+        if not query:
+            print()
+            for i, app in enumerate(shown):
+                tag = " (last used)" if app == last_app else ""
+                marker = "→" if i == 0 else " "
+                print(f"  {marker} [{i + 1}] {app}{tag}")
+            if len(filtered) > 15:
+                print(f"    ... {len(filtered) - 15} more — type to filter")
+        else:
+            print()
+            for i, app in enumerate(shown):
+                print(f"    [{i + 1}] {app}")
+            if not shown:
+                print("    No matches")
+
+        try:
+            raw = input(f"\n  Filter/select [{query}]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            raise KeyboardInterrupt
+
+        if not raw:
+            if filtered:
+                return filtered[0]
+            continue
+
+        # Number = direct selection
+        try:
+            idx = int(raw) - 1
+            if 0 <= idx < len(shown):
+                return shown[idx]
+        except ValueError:
+            pass
+
+        # Text = update filter
+        query = raw.lower()
+        filtered = [a for a in apps if query in a.lower()]
+        if len(filtered) == 1:
+            return filtered[0]
 
 
 def _interactive_setup() -> dict:
@@ -67,7 +142,7 @@ def _interactive_setup() -> dict:
             print("\n  No capturable apps found. Make sure an app is running and playing audio.")
             sys.exit(1)
 
-        app_name = _pick("Choose app:", apps)
+        app_name = _pick_app(apps)
     else:
         mic = True
         from .audio.mic_capture import list_devices
@@ -80,20 +155,31 @@ def _interactive_setup() -> dict:
                 idx = names.index(choice) - 1
                 device = devices[idx]["name"]
 
-    # 2. Source language
+    # 2. Source language (default from last session)
+    last = _load_last_session()
     lang_options = ["Auto-detect"] + [
         f"{code} — {name}" for code, name in sorted(LANGUAGE_MAP.items())
     ]
-    lang_choice = _pick("Source language:", lang_options)
+    lang_default = 0
+    if last.get("lang"):
+        for i, opt in enumerate(lang_options):
+            if opt.startswith(f"{last['lang']} — "):
+                lang_default = i
+                break
+    lang_choice = _pick("Source language:", lang_options, default=lang_default)
     lang = None
     if lang_choice != "Auto-detect":
         lang = lang_choice.split(" — ")[0]
 
-    # 3. Translation model
-    model_choice = _pick(
-        "Translation model:",
-        ["haiku (fastest, ~$0.30/hr)", "sonnet (better, ~$1/hr)", "opus (best, ~$5/hr)", "none (transcription only)"],
-    )
+    # 3. Translation model (default from last session)
+    model_options = ["haiku (fastest, ~$0.30/hr)", "sonnet (better, ~$1/hr)", "opus (best, ~$5/hr)", "none (transcription only)"]
+    model_default = 0
+    if last.get("translate_model"):
+        for i, opt in enumerate(model_options):
+            if opt.startswith(last["translate_model"]):
+                model_default = i
+                break
+    model_choice = _pick("Translation model:", model_options, default=model_default)
     translate_model = None
     no_translate = False
     if "none" in model_choice:
@@ -101,7 +187,7 @@ def _interactive_setup() -> dict:
     else:
         translate_model = model_choice.split(" ")[0]
 
-    return {
+    result = {
         "app_name": app_name,
         "mic": mic,
         "device": device,
@@ -109,6 +195,15 @@ def _interactive_setup() -> dict:
         "translate_model": translate_model,
         "no_translate": no_translate,
     }
+
+    # Remember for next time
+    _save_last_session({
+        "app": app_name,
+        "lang": lang,
+        "translate_model": translate_model,
+    })
+
+    return result
 
 
 def main():
@@ -141,6 +236,7 @@ examples:
     parser.add_argument("--translate-model", metavar="TIER", default="haiku",
                         choices=["haiku", "sonnet", "opus"], help="Claude model tier")
     parser.add_argument("--no-translate", action="store_true", help="Transcribe only")
+    parser.add_argument("--diarize", action="store_true", help="Enable speaker diarization (requires langlistn[diarize])")
     parser.add_argument("--json", dest="output_json", action="store_true", help="JSON output for --list-*")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
 
@@ -229,6 +325,7 @@ examples:
         max_context_chars=args.max_context,
         silence_reset_seconds=args.silence_reset,
         force_confirm_after=args.force_confirm,
+        diarize=args.diarize,
     )
 
     try:

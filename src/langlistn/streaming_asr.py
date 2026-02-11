@@ -197,9 +197,9 @@ class OnlineASRProcessor:
         if len(self.audio_buffer) / SAMPLING_RATE > self.buffer_trimming_sec:
             self._chunk_completed_segment(res)
 
-        # Hard cap: if buffer exceeds 30s, force trim to keep last 15s
+        # Hard cap: if buffer exceeds 35s, force trim to keep buffer_trimming_sec
         buf_secs = len(self.audio_buffer) / SAMPLING_RATE
-        if buf_secs > 30:
+        if buf_secs > self.buffer_trimming_sec + 10:
             trim_to = self.buffer_time_offset + buf_secs - self.buffer_trimming_sec
             logger.debug("hard cap: trimming to %.2f (buffer was %.2fs)", trim_to, buf_secs)
             self._chunk_at(trim_to)

@@ -117,8 +117,15 @@ class ContinuationTranslator:
             self._client = boto3.client("bedrock-runtime", **kwargs)
         return self._client
 
-    def translate(self, source_text: str) -> tuple[str, str]:
-        """Translate source text. Returns (confirmed, speculative)."""
+    def translate(
+        self, source_text: str, alt_hypotheses: list[str] | None = None,
+    ) -> tuple[str, str]:
+        """Translate source text. Returns (confirmed, speculative).
+
+        alt_hypotheses: alternative whisper transcriptions of the speculative
+        tail — different runs may transcribe ambiguous audio differently.
+        Feeding these to the LLM helps disambiguate homophones.
+        """
         if not source_text.strip():
             return self.confirmed_translation, self.speculative_translation
 
@@ -135,7 +142,9 @@ class ContinuationTranslator:
         if len(confirmed_ctx) > self.max_context_chars:
             confirmed_ctx = confirmed_ctx[-self.max_context_chars:]
 
-        prompt = self._build_prompt(lang_name, source_trimmed, confirmed_ctx)
+        prompt = self._build_prompt(
+            lang_name, source_trimmed, confirmed_ctx, alt_hypotheses
+        )
 
         client = self._get_client()
         body = {
@@ -177,7 +186,11 @@ class ContinuationTranslator:
             return self.confirmed_translation, self.speculative_translation
 
     def _build_prompt(
-        self, lang_name: str, source_text: str, confirmed_english: str
+        self,
+        lang_name: str,
+        source_text: str,
+        confirmed_english: str,
+        alt_hypotheses: list[str] | None = None,
     ) -> str:
         """Ask for FULL translation, but provide confirmed English as guidance."""
         parts = [
@@ -192,6 +205,16 @@ class ContinuationTranslator:
             f"=== {lang_name} transcript ===",
             source_text,
         ]
+
+        # Alternative whisper hypotheses for disambiguation
+        if alt_hypotheses:
+            parts.extend([
+                "",
+                "=== Alternative transcriptions of recent audio (may help disambiguate) ===",
+            ])
+            for i, hyp in enumerate(alt_hypotheses, 1):
+                # Only include tail — these are just the speculative portion
+                parts.append(f"Alt {i}: {hyp[-300:]}")
 
         if confirmed_english:
             parts.extend([
