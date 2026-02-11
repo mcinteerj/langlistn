@@ -253,6 +253,7 @@ async def run_pipeline(
     threading.Thread(target=_load, daemon=True).start()
     await load_done.wait()
     await spinner.stop()
+    display.update("", "", "⏸  waiting for speech...")
 
     if load_error:
         sys.stderr.write(f"\nModel load failed: {load_error}\n")
