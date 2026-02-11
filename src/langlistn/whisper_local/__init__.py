@@ -27,9 +27,9 @@ from ..realtime import EventKind, SessionEvent
 # ---------------------------------------------------------------------------
 # Sliding window constants
 # ---------------------------------------------------------------------------
-WINDOW_SECONDS = 5.0        # Total window fed to Whisper
-STEP_SECONDS = 2.0          # How often we run Whisper (new audio per step)
-OVERLAP_SECONDS = WINDOW_SECONDS - STEP_SECONDS  # 3s overlap
+WINDOW_SECONDS = 20.0       # Total window fed to Whisper (longer = much better translation)
+STEP_SECONDS = 5.0          # How often we run Whisper (new audio per step)
+OVERLAP_SECONDS = WINDOW_SECONDS - STEP_SECONDS  # 15s overlap
 CONFIRM_APPEARANCES = 2     # Text must appear in N consecutive windows to confirm
 SAMPLE_RATE = 16000          # Input sample rate from capture
 BYTES_PER_SAMPLE = 2
