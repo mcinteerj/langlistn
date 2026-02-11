@@ -110,18 +110,22 @@ class MLXWhisperASR:
         self._mlx_whisper = mlx_whisper
 
     def transcribe(self, audio: np.ndarray, init_prompt: str = "") -> list[dict]:
+        # Cap init_prompt to avoid KV cache bloat (perplexity confirms 2-5x slowdown)
+        prompt = (init_prompt or "")[-100:] or None
         result = self._mlx_whisper.transcribe(
             audio,
             path_or_hf_repo=self.model_path,
             task=self.task,
             language=self.lang,
-            initial_prompt=init_prompt or None,
+            initial_prompt=prompt,
             fp16=True,
             word_timestamps=True,
             no_speech_threshold=0.5,
             condition_on_previous_text=False,
             compression_ratio_threshold=2.4,
             logprob_threshold=-1.0,
+            temperature=0.0,
+            best_of=1,
         )
         return result.get("segments", [])
 

@@ -2,7 +2,7 @@
 
 Real-time audio translation to English on your Mac. Point it at any app or microphone and get live English subtitles — works with Korean, Japanese, Thai, Cantonese, and 90+ other languages.
 
-Local Whisper transcription + cloud translation via AWS Bedrock Claude for natural, accurate results at ~$0.10/hr.
+Local Whisper transcription + cloud translation via AWS Bedrock Claude for natural, accurate results.
 
 > **macOS 15+** · **Apple Silicon (M1+)** · **Python 3.11+** · **AWS account** (for translation)
 
@@ -10,14 +10,55 @@ Local Whisper transcription + cloud translation via AWS Bedrock Claude for natur
 
 ```
 App/Mic audio → Swift helper (ScreenCaptureKit) → 16kHz PCM
-    → mlx-whisper large-v3 (local, free)
-    → LocalAgreement-2 (confirmed when 2 runs agree)
-    → English? → passthrough
-    → Other?  → AWS Bedrock Claude → natural English
-    → terminal (bold confirmed, dim speculative)
+    ↓
+Silero VAD gate (only speech passes through)
+    ↓
+mlx-whisper large-v2 (local, free)
+    ↓
+LocalAgreement-2 (confirmed when 2 consecutive runs agree)
+    ↓
+Claude translation (continuation-based prompting)
+    ↓
+Two-zone terminal (bold = confirmed, dim italic = speculative)
 ```
 
-Audio is captured per-app via ScreenCaptureKit. Whisper transcribes in the source language locally using a growing buffer with [LocalAgreement-2](https://github.com/ufal/whisper_streaming) — text is confirmed only when two consecutive Whisper runs produce the same words. Confirmed non-English text is translated by Claude on AWS Bedrock. English speech passes through without an API call.
+### Two confidence loops
+
+```
+┌─────────────────────────────────────────────┐
+│  TRANSCRIPTION LOOP (~1-2s cycle)           │
+│                                             │
+│  Audio chunks                               │
+│    → Silero VAD (discard non-speech)        │
+│    → mlx-whisper transcribe                 │
+│      init_prompt = prior confirmed text     │
+│    → LocalAgreement-2 → confirmed source    │
+│                                             │
+│  Speculative: current whisper hypothesis    │
+│  Confirmed: agreed by 2 consecutive runs    │
+└──────────────┬──────────────────────────────┘
+               ↓
+┌─────────────────────────────────────────────┐
+│  TRANSLATION LOOP (on every whisper cycle)  │
+│                                             │
+│  Prompt to Claude:                          │
+│    "Korean transcript: {full_source}"       │
+│    "Reference translation: {confirmed_en}"  │
+│    "Produce full updated translation"       │
+│                                             │
+│  Confirmation:                              │
+│    Compare against last 4 LLM outputs       │
+│    Lock at word/sentence boundary            │
+│    Force-lock after 3 unstable cycles       │
+│                                             │
+│  confirmed_en fed back as reference ──────┐ │
+└──────────────┬────────────────────────────┘ │
+               ↓                     ↑        │
+        Terminal display             └────────┘
+        bold = locked, dim italic = live tail
+```
+
+Audio is captured per-app via ScreenCaptureKit. Non-speech audio (music, silence) is filtered by Silero VAD before reaching Whisper. Whisper transcribes in the source language using a growing buffer with LocalAgreement-2 — text is confirmed only when two consecutive runs agree. The full source transcript and confirmed English are sent to Claude, which produces an updated translation. Translation is confirmed by diffing consecutive LLM outputs — stable prefixes are locked and fed back as context.
 
 ## Quick start
 
@@ -44,6 +85,10 @@ Your AWS profile needs access to Bedrock Claude models in your configured region
 ### Run
 
 ```bash
+# Interactive setup — choose app, language, model
+langlistn
+
+# Or direct
 langlistn --app "Google Chrome" --source ko
 ```
 
@@ -69,16 +114,7 @@ langlistn --app "Google Chrome" --source ko     # Korean
 langlistn --app "zoom.us" --source ja            # Japanese
 langlistn --app "Microsoft Teams" --source zh    # Mandarin
 langlistn --app "Google Chrome" --source th      # Thai
-langlistn --app "Google Chrome" --source fr      # French
 ```
-
-<details>
-<summary>All supported language codes</summary>
-
-`ko` Korean · `ja` Japanese · `zh` Mandarin · `th` Thai · `vi` Vietnamese · `fr` French · `de` German · `es` Spanish · `ar` Arabic · `hi` Hindi · `pt` Portuguese · `it` Italian · `ru` Russian · `id` Indonesian · `ms` Malay · `tl` Tagalog
-
-Whisper supports 99 languages — these codes are hints, not requirements.
-</details>
 
 ### Translation model
 
@@ -92,31 +128,20 @@ langlistn --app "zoom.us" --source ko --translate-model opus    # best quality
 
 | Model | Latency | Cost/hr | Best for |
 |-------|---------|---------|----------|
-| `haiku` | ~300ms | ~$0.10 | Meetings, casual use |
-| `sonnet` | ~500ms | ~$0.30 | Important conversations |
-| `opus` | ~800ms | ~$1.50 | Maximum accuracy |
+| `haiku` | ~300ms | ~$0.30 | Meetings, casual use |
+| `sonnet` | ~500ms | ~$1.00 | Important conversations |
+| `opus` | ~800ms | ~$5.00 | Maximum accuracy |
 
 ### Transcribe only (no translation)
 
-Skip the API call — just show Whisper's raw transcription:
-
 ```bash
 langlistn --app "Google Chrome" --source ko --no-translate
-```
-
-### Dual language
-
-Show original language above the English translation:
-
-```bash
-langlistn --app "Google Chrome" --source ko --dual-lang
 ```
 
 ### Microphone
 
 ```bash
 langlistn --mic
-langlistn --mic --device "MacBook Pro Microphone"
 langlistn --mic --source ko
 ```
 
@@ -126,13 +151,23 @@ Strip all ANSI formatting and speculative text — only confirmed translations:
 
 ```bash
 langlistn --app "Google Chrome" --plain | tee meeting.txt
-langlistn --app "zoom.us" --plain --source ja > transcript.txt
 ```
 
-### Logging
+### Debug logging
+
+Full whisper transcripts and LLM responses to file:
 
 ```bash
-langlistn --app "Google Chrome" --log meeting.txt
+langlistn --app "Google Chrome" --source ko --debug-log debug.log
+```
+
+### Tunables
+
+```bash
+langlistn --app "Google Chrome" --source ko \
+  --max-context 2000 \       # Max chars of source/translation context sent to LLM
+  --silence-reset 10 \       # Seconds of silence before resetting translation context
+  --force-confirm 3          # Force-lock translation after N unstable cycles
 ```
 
 ### Discovery
@@ -142,88 +177,35 @@ langlistn --list-apps       # Show capturable apps (must be running)
 langlistn --list-devices    # Show audio input devices
 ```
 
-## Mixed-language meetings
-
-langlistn handles meetings where speakers switch between languages. English speech passes through directly (no API call), non-English speech gets translated. No configuration needed — it detects the language automatically.
-
-```bash
-# Korean/English meeting
-langlistn --app "zoom.us" --source ko
-
-# The --source hint helps Whisper with the primary non-English language
-# but English segments still pass through untranslated
-```
-
-## Model selection
-
-The Whisper model is auto-selected based on your Mac's RAM:
-
-| RAM | Model | Size |
-|-----|-------|------|
-| 16GB+ | `whisper-large-v3` | 3GB |
-| 12GB | `whisper-medium` | 1.5GB |
-| 8GB | `whisper-small` | 500MB |
-
-Override with `--model`:
-
-```bash
-langlistn --app "Google Chrome" --model mlx-community/whisper-large-v3-mlx
-langlistn --app "Google Chrome" --model mlx-community/whisper-medium-mlx
-```
-
 ## Architecture
-
-### Cascade pipeline
-
-```
-Audio capture (Swift ScreenCaptureKit, 16kHz PCM mono)
-         │
-         ▼
-Local Whisper transcription (mlx-whisper, growing buffer)
-         │
-         ▼
-LocalAgreement-2 (commit text when 2 consecutive runs agree)
-         │
-    ┌────┴────┐
-    │         │
- English   Non-English
-    │         │
- passthru  Bedrock Claude translate (with context window)
-    │         │
-    └────┬────┘
-         │
-         ▼
-Terminal display (bold confirmed, dim speculative)
-```
 
 ### Key design decisions
 
-- **Transcribe, don't translate with Whisper**: Whisper's `translate` task rephrases the same audio differently each run, breaking agreement-based confirmation. Transcribing in the source language produces consistent output that LocalAgreement can work with.
-- **LocalAgreement-2**: Vendored from [whisper_streaming](https://github.com/ufal/whisper_streaming) (MIT). Text is confirmed only when two consecutive Whisper runs agree on the same words — eliminates content loss and excessive repetition.
-- **Growing buffer with segment trimming**: Audio buffer grows naturally, trimmed at segment boundaries (15s threshold, 30s hard cap) to keep processing time bounded.
-- **Context-aware translation**: Each Claude translation call includes the last ~500 chars of confirmed English as context, so translations flow naturally between chunks.
-- **Non-blocking translation**: API calls run concurrently with Whisper processing — translation latency doesn't delay the next transcription cycle.
+- **Transcribe, don't translate with Whisper**: Whisper's `translate` task rephrases the same audio differently each run, breaking agreement-based confirmation. Transcribing in the source language produces consistent output.
+- **Whisper large-v2 over v3**: v3 hallucinates significantly more on non-English audio (4x higher in benchmarks). v2 is more reliable for Korean, Japanese, and other Asian languages.
+- **Silero VAD gate**: Filters non-speech audio before Whisper. Prevents hallucination loops on silence, music, and background noise — the primary cause of Whisper producing garbage output.
+- **LocalAgreement-2**: Text confirmed only when two consecutive Whisper runs agree on the same words — eliminates content loss and repetition.
+- **Continuation-based translation**: Each Claude call gets the full source transcript + confirmed English as reference. The LLM produces a full updated translation, not just a continuation — this avoids overlap/duplication errors.
+- **Two-zone confirmation**: Translation is confirmed by diffing recent LLM outputs. Stable prefixes lock at word boundaries. Force-confirm after 3 unstable cycles prevents text from staying speculative forever.
+- **Ring buffer comparison**: Compares current LLM output against the last 4 outputs, not just the previous one. If outputs 1 and 3 agree (even though 2 differed), confirmation still fires.
 
-### Cost comparison
+### Project structure
 
-| Mode | Cost/hr | Quality |
-|------|---------|---------|
-| langlistn (Haiku) | ~$0.10 | Good transcription + natural translation |
-| langlistn (Sonnet) | ~$0.30 | Good transcription + high-quality translation |
-| GPT Realtime API | ~$3.60 | Streaming, lower latency |
-| AWS Transcribe + translate | ~$1.50 | Good, no local compute |
-
-## Remote API mode
-
-For streaming via Azure OpenAI Realtime API (lower latency, higher cost):
-
-```bash
-pip install "langlistn[remote]"
-
-export AZURE_OPENAI_API_KEY="your-key"
-export OPENAI_API_BASE="https://your-resource.openai.azure.com/"
-
-langlistn --app "Google Chrome" --remote
+```
+langlistn/
+├── pyproject.toml
+├── src/langlistn/
+│   ├── __main__.py           # Interactive setup + CLI entry point
+│   ├── pipeline.py           # Two-loop orchestrator (transcription + translation)
+│   ├── streaming_asr.py      # LocalAgreement-2 engine (from whisper_streaming)
+│   ├── translate.py          # Continuation-based Bedrock Claude translation
+│   ├── display.py            # Two-zone terminal renderer
+│   ├── config.py             # Languages, constants, model selection
+│   ├── audio/
+│   │   ├── __init__.py       # App capture (ScreenCaptureKit)
+│   │   └── mic_capture.py    # Mic capture (sounddevice)
+└── swift/
+    └── AudioCaptureHelper/   # Swift ScreenCaptureKit helper
 ```
 
 ## Troubleshooting
@@ -234,32 +216,9 @@ langlistn --app "Google Chrome" --remote
 | **Swift build fails** | Install Xcode Command Line Tools: `xcode-select --install` |
 | **Translation errors** | Check AWS auth: `aws sts get-caller-identity`. Ensure Bedrock Claude access. |
 | **App not in `--list-apps`** | The app must be running and producing audio. |
-| **Slow first run** | Model download (~3GB for large-v3). Cached after first run. |
-| **Out of memory** | Use a smaller model: `--model mlx-community/whisper-small-mlx` |
-| **Hallucination loops** | Built-in detection suppresses these. Try adding `--source` hint. |
+| **Slow first run** | Model download (~3GB for large-v2). Cached after first run. |
+| **Hallucination loops** | Built-in VAD + hallucination detection. Try adding `--source` hint. |
 | **Intel Mac** | Not supported. mlx-whisper requires Apple Silicon (M1+). |
-
-## Project structure
-
-```
-langlistn/
-├── pyproject.toml
-├── src/langlistn/
-│   ├── __main__.py           # CLI entry point
-│   ├── cli_output.py         # Cascade pipeline + terminal display
-│   ├── streaming_asr.py      # LocalAgreement-2 engine (from whisper_streaming)
-│   ├── translate.py          # AWS Bedrock Claude translation
-│   ├── config.py             # Languages, constants
-│   ├── audio/
-│   │   ├── __init__.py       # App capture (ScreenCaptureKit)
-│   │   └── mic_capture.py    # Mic capture (sounddevice)
-│   ├── whisper_local/
-│   │   └── __init__.py       # Whisper model loading, hallucination detection
-│   ├── realtime/             # Azure OpenAI Realtime API (--remote)
-│   └── tui/                  # Terminal UI (Textual, --remote --tui)
-└── swift/
-    └── AudioCaptureHelper/   # Swift ScreenCaptureKit helper
-```
 
 ## License
 
