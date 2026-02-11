@@ -73,6 +73,11 @@ examples:
                              help="Show original language above English translation")
     local_group.add_argument("--plain", action="store_true",
                              help="Pipe-friendly — no ANSI, no speculative, just confirmed text")
+    local_group.add_argument("--translate-model", metavar="TIER", default="haiku",
+                             choices=["haiku", "sonnet", "opus"],
+                             help="Claude model for translation (default: haiku)")
+    local_group.add_argument("--no-translate", action="store_true",
+                             help="Transcribe only, no translation")
 
     # Remote API options
     remote_group = parser.add_argument_group("remote API (--remote)")
@@ -145,6 +150,8 @@ examples:
                     log_path=args.log,
                     plain=args.plain,
                     dual_lang=args.dual_lang,
+                    translate_model=args.translate_model,
+                    no_translate=args.no_translate,
                 )
             )
     except KeyboardInterrupt:

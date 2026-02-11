@@ -72,7 +72,18 @@ def _seconds_to_bytes(seconds: float) -> int:
 
 
 def _is_hallucination(text: str) -> bool:
-    """Detect Whisper hallucination loops (repeated phrases)."""
+    """Detect Whisper hallucination loops (repeated phrases/characters)."""
+    # CJK character repetition (e.g. 紅紅紅紅紅)
+    if len(text) > 10:
+        from collections import Counter
+        char_counts = Counter(c for c in text if not c.isspace())
+        if char_counts:
+            most_common_count = char_counts.most_common(1)[0][1]
+            total_chars = sum(char_counts.values())
+            if most_common_count > 10 and most_common_count / total_chars > 0.5:
+                logger.debug("Hallucination: char repetition %d/%d", most_common_count, total_chars)
+                return True
+
     words = text.split()
     if len(words) < 8:
         return False
