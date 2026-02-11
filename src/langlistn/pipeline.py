@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 from .audio import AudioSource
 from .config import SILENCE_RMS_THRESHOLD
-from .display import TerminalDisplay
+from .display import Spinner, TerminalDisplay
 from .streaming_asr import MLXWhisperASR, OnlineASRProcessor, SAMPLING_RATE
 from .diarize import SpeakerTracker
 from .translate import ContinuationTranslator
@@ -198,7 +198,20 @@ async def run_pipeline(
     loading_msg = f"loading {model_name} + VAD"
     if speaker_tracker:
         loading_msg += " + diarization"
-    display.update("", "", loading_msg + "...")
+
+    # Detect first-run: check if model files are cached locally
+    hint = ""
+    try:
+        import huggingface_hub
+        local_path = huggingface_hub.try_to_load_from_cache(model_name, "config.json")
+        if local_path is None:
+            hint = "(downloading model ~3GB — first run only)"
+    except Exception:
+        pass
+
+    spinner = Spinner(loading_msg, hint=hint)
+    await spinner.start()
+
     loop = asyncio.get_running_loop()
     load_done = asyncio.Event()
     load_error = None
@@ -220,6 +233,8 @@ async def run_pipeline(
 
     threading.Thread(target=_load, daemon=True).start()
     await load_done.wait()
+    await spinner.stop()
+
     if load_error:
         sys.stderr.write(f"\nModel load failed: {load_error}\n")
         return
