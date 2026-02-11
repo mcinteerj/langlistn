@@ -11,8 +11,15 @@ errors compound across calls.
 import json
 import logging
 import re
+import sys
 
 import boto3
+from botocore.exceptions import (
+    ClientError,
+    NoCredentialsError,
+    TokenRetrievalError,
+    UnauthorizedSSOTokenError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -109,13 +116,33 @@ class ContinuationTranslator:
         self.output_tokens = 0
         self.calls = 0
 
+    _auth_failed: bool = False
+    _auth_error_shown: bool = False
+
     def _get_client(self):
         if self._client is None:
             kwargs = {}
             if self._region:
                 kwargs["region_name"] = self._region
-            self._client = boto3.client("bedrock-runtime", **kwargs)
+            try:
+                self._client = boto3.client("bedrock-runtime", **kwargs)
+            except (NoCredentialsError, TokenRetrievalError, UnauthorizedSSOTokenError) as e:
+                self._handle_auth_error(e)
+                raise
         return self._client
+
+    def _handle_auth_error(self, error: Exception):
+        """Show a clear auth error message once."""
+        if self._auth_error_shown:
+            return
+        self._auth_error_shown = True
+        self._auth_failed = True
+        msg = str(error)
+        sys.stderr.write(
+            f"\n\033[1;31m✗ AWS auth failed\033[0m: {msg}\n"
+            f"  Run \033[1maws sso login\033[0m and try again.\n\n"
+        )
+        logger.error("AWS auth failed: %s", msg)
 
     def translate(
         self, source_text: str, alt_hypotheses: list[str] | None = None,
@@ -146,7 +173,15 @@ class ContinuationTranslator:
             lang_name, source_trimmed, confirmed_ctx, alt_hypotheses
         )
 
-        client = self._get_client()
+        # Skip all LLM calls after auth failure
+        if self._auth_failed:
+            return self.confirmed_translation, self.speculative_translation
+
+        try:
+            client = self._get_client()
+        except (NoCredentialsError, TokenRetrievalError, UnauthorizedSSOTokenError):
+            return self.confirmed_translation, self.speculative_translation
+
         body = {
             "anthropic_version": "bedrock-2023-05-31",
             "max_tokens": 1024,
@@ -181,6 +216,16 @@ class ContinuationTranslator:
             self._update_confirmation(full_translation)
             return self.confirmed_translation, self.speculative_translation
 
+        except (NoCredentialsError, TokenRetrievalError, UnauthorizedSSOTokenError) as e:
+            self._handle_auth_error(e)
+            return self.confirmed_translation, self.speculative_translation
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if code in ("ExpiredTokenException", "UnrecognizedClientException", "AccessDeniedException"):
+                self._handle_auth_error(e)
+            else:
+                logger.error("Translation failed: %s", e)
+            return self.confirmed_translation, self.speculative_translation
         except Exception as e:
             logger.error("Translation failed: %s", e)
             return self.confirmed_translation, self.speculative_translation
