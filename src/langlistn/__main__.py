@@ -79,6 +79,8 @@ environment variables:
                         help="Use local Whisper instead of OpenAI Realtime API (free, offline)")
     parser.add_argument("--model", metavar="NAME", default="mlx-community/whisper-large-v3-mlx",
                         help="Whisper model for --local mode (default: mlx-community/whisper-large-v3-mlx)")
+    parser.add_argument("--tui", action="store_true",
+                        help="Use full TUI instead of plain terminal output (with --local)")
     parser.add_argument("--json", dest="output_json", action="store_true", help="JSON output (for --list-*)")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
 
@@ -112,19 +114,34 @@ environment variables:
     from .app import run_app
 
     try:
-        asyncio.run(
-            run_app(
-                app_name=args.app,
-                mic=args.mic,
-                device=args.device,
-                lang=args.lang,
-                deployment=args.deployment,
-                log_path=args.log,
-                show_transcript=args.transcript,
-                local=args.local,
-                model=args.model,
+        if args.local and not args.tui:
+            # Plain terminal output — no Textual, no FD issues
+            from .cli_output import run_cli
+            asyncio.run(
+                run_cli(
+                    app_name=args.app,
+                    mic=args.mic,
+                    device=args.device,
+                    lang=args.lang,
+                    model=args.model,
+                    log_path=args.log,
+                )
             )
-        )
+        else:
+            from .app import run_app
+            asyncio.run(
+                run_app(
+                    app_name=args.app,
+                    mic=args.mic,
+                    device=args.device,
+                    lang=args.lang,
+                    deployment=args.deployment,
+                    log_path=args.log,
+                    show_transcript=args.transcript,
+                    local=args.local,
+                    model=args.model,
+                )
+            )
     except KeyboardInterrupt:
         pass
 
