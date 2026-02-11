@@ -13,15 +13,14 @@ Loop 2 — Translation (on every transcription change):
 Both loops feed a shared display with locked/speculative zones.
 """
 
-import array
 import asyncio
 import logging
-import math
 import signal
 import sys
 import threading
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -64,7 +63,6 @@ class PipelineConfig:
     """Tunables for the two-loop pipeline."""
 
     # Transcription
-    process_interval: float = 0.5
     min_audio_seconds: float = 1.0
     buffer_trimming_sec: float = 18
     whisper_timeout: float = 8.0        # Kill whisper if it takes longer than this
@@ -78,11 +76,10 @@ class PipelineConfig:
     silence_reset_seconds: float = 10.0
 
 def _rms_int16(chunk: bytes) -> float:
-    samples = array.array("h")
-    samples.frombytes(chunk)
-    if not samples:
+    samples = np.frombuffer(chunk, dtype=np.int16)
+    if len(samples) == 0:
         return 0.0
-    return math.sqrt(sum(s * s for s in samples) / len(samples))
+    return float(np.sqrt(np.mean(samples.astype(np.float64) ** 2)))
 
 
 def _is_hallucination(text: str) -> bool:
@@ -272,7 +269,10 @@ async def run_pipeline(
 
     state = SharedState(last_speech_time=time.time())
     source_changed = asyncio.Event()
+    audio_ready = asyncio.Event()  # set by audio_loop when enough new audio arrives
     whisper_lock = asyncio.Lock()
+    executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="langlistn")
+    new_audio_seconds = 0.0  # tracks audio accumulated since last whisper run
     windows_processed = 0
     processing_time_total = 0.0
     start_time = time.time()
@@ -291,19 +291,29 @@ async def run_pipeline(
         return f"🎧 {runtime_str} · {cost_display}".rstrip(" ·")
 
     async def audio_loop():
+        nonlocal new_audio_seconds
+        vad_cooldown = 0  # skip VAD for N chunks after speech detected
         while not shutdown.is_set():
             chunk = await source.read_chunk()
             if chunk is None:
                 break
             rms = _rms_int16(chunk)
             if rms < SILENCE_RMS_THRESHOLD:
+                vad_cooldown = 0  # silence resets cooldown
                 continue
             samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
             if vad_model is not None:
-                if not _chunk_has_speech(vad_model, samples):
+                if vad_cooldown > 0:
+                    vad_cooldown -= 1
+                elif not _chunk_has_speech(vad_model, samples):
                     continue
+                else:
+                    vad_cooldown = 8  # ~0.5s: skip VAD during established speech
             state.last_speech_time = time.time()
             processor.insert_audio_chunk(samples)
+            new_audio_seconds += len(samples) / SAMPLING_RATE
+            if new_audio_seconds >= cfg.min_audio_seconds:
+                audio_ready.set()
 
 
     async def whisper_loop():
@@ -319,7 +329,15 @@ async def run_pipeline(
         display.update("", "", "listening...")
 
         while not shutdown.is_set():
-            await asyncio.sleep(cfg.process_interval)
+            # Event-driven: wait for audio_loop to signal enough new audio,
+            # with timeout for silence detection and status updates
+            try:
+                await asyncio.wait_for(audio_ready.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                pass
+            audio_ready.clear()
+            new_audio_seconds = 0.0
+
             if shutdown.is_set():
                 break
 
@@ -338,7 +356,6 @@ async def run_pipeline(
                                 )
                                 translator.speculative_translation = ""
                                 display.update(translator.confirmed_translation, "", "silence — context locked")
-                            translator._last_full_output = ""
                         else:
                             state.confirmed_display += (" " + state.confirmed_source if state.confirmed_display else state.confirmed_source)
                             state.confirmed_display = state.confirmed_display.strip()
@@ -368,7 +385,7 @@ async def run_pipeline(
             async with whisper_lock:
                 t0 = time.time()
                 try:
-                    fut = loop.run_in_executor(None, processor.process_iter)
+                    fut = loop.run_in_executor(executor, processor.process_iter)
                     _beg, _end, confirmed = await asyncio.wait_for(
                         asyncio.shield(fut), timeout=cfg.whisper_timeout,
                     )
@@ -380,9 +397,9 @@ async def run_pipeline(
                         elapsed, consecutive_timeouts,
                     )
                     try:
-                        await fut
-                    except Exception:
-                        pass
+                        await asyncio.wait_for(fut, timeout=30.0)
+                    except (asyncio.TimeoutError, Exception):
+                        logger.error("WHISPER thread hung or failed — discarding")
                     logger.warning("WHISPER slow run finished after %.1fs total — discarding", time.time() - t0)
                     if consecutive_timeouts >= 2:
                         logger.warning("WHISPER resetting processor after %d consecutive timeouts", consecutive_timeouts)
@@ -419,16 +436,16 @@ async def run_pipeline(
                             is_halluc = True
 
                 speculative = processor.get_speculative()
-                if speculative and _is_hallucination(speculative):
+
+                # Stash raw hypothesis before filtering
+                if speculative and not _is_hallucination(speculative):
+                    recent_whisper_hypotheses.append(speculative)
+                elif speculative:
                     speculative = ""
                     is_halluc = True
 
-                # Stash raw whisper hypothesis
-                raw_hyp = processor.get_speculative()
-                if raw_hyp and not _is_hallucination(raw_hyp):
-                    recent_whisper_hypotheses.append(raw_hyp)
-                    if len(recent_whisper_hypotheses) > 3:
-                        recent_whisper_hypotheses.pop(0)
+                while len(recent_whisper_hypotheses) > 3:
+                    recent_whisper_hypotheses.pop(0)
 
                 # Track consecutive hallucinations
                 if is_halluc and not confirmed:
@@ -465,6 +482,9 @@ async def run_pipeline(
                 if log_file and confirmed:
                     log_file.write(f"{confirmed}\n")
                     log_file.flush()
+
+            # Brief cooldown between whisper runs — lets CPU/GPU clock down
+            await asyncio.sleep(0.2)
 
 
     async def translate_loop():
@@ -518,7 +538,7 @@ async def run_pipeline(
             state.streaming_active = True
             try:
                 locked, spec = await loop.run_in_executor(
-                    None, translator.translate_streaming, full_source, alt_hypotheses, on_token
+                    executor, translator.translate_streaming, full_source, alt_hypotheses, on_token
                 )
             except Exception:
                 locked = translator.confirmed_translation
@@ -596,3 +616,5 @@ async def run_pipeline(
 
         if log_file:
             log_file.close()
+
+        executor.shutdown(wait=False)

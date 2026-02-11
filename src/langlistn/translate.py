@@ -89,7 +89,6 @@ class ContinuationTranslator:
         # State
         self.confirmed_translation: str = ""
         self.speculative_translation: str = ""
-        self._last_full_output: str = ""
         self._recent_outputs: list[str] = []  # ring buffer of last N outputs
         self._max_recent: int = 4
         self._cycles_since_last_confirm: int = 0
@@ -358,7 +357,6 @@ class ContinuationTranslator:
             self._recent_outputs.pop(0)
 
         if len(self._recent_outputs) < 2:
-            self._last_full_output = full_output
             self.speculative_translation = full_output
             self._cycles_since_last_confirm += 1
             self._maybe_force_confirm(full_output)
@@ -399,7 +397,6 @@ class ContinuationTranslator:
 
         # Speculative = everything after confirmed in the NEW output
         self.speculative_translation = full_output[len(self.confirmed_translation):].strip()
-        self._last_full_output = full_output
 
         logger.debug(
             "CONFIRM state: common_prefix=%d lock_pos=%d confirmed_len=%d "

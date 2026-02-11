@@ -145,13 +145,17 @@ class MLXWhisperASR:
 class OnlineASRProcessor:
     """Growing-buffer processor with LocalAgreement-2 and segment trimming."""
 
+    # Pre-allocate buffer for ~35s at 16kHz to avoid repeated np.append copies.
+    _PREALLOC_SAMPLES = SAMPLING_RATE * 35
+
     def __init__(self, asr: MLXWhisperASR, buffer_trimming_sec: float = 15):
         self.asr = asr
         self.buffer_trimming_sec = buffer_trimming_sec
         self.init()
 
     def init(self, offset: float | None = None):
-        self.audio_buffer = np.array([], dtype=np.float32)
+        self._audio_buf = np.zeros(self._PREALLOC_SAMPLES, dtype=np.float32)
+        self._buf_len = 0  # number of valid samples in _audio_buf
         self.transcript_buffer = HypothesisBuffer()
         self.buffer_time_offset = 0.0
         if offset is not None:
@@ -159,8 +163,21 @@ class OnlineASRProcessor:
         self.transcript_buffer.last_commited_time = self.buffer_time_offset
         self.commited: list[tuple] = []
 
+    @property
+    def audio_buffer(self) -> np.ndarray:
+        """View of valid audio samples (no copy)."""
+        return self._audio_buf[:self._buf_len]
+
     def insert_audio_chunk(self, audio: np.ndarray):
-        self.audio_buffer = np.append(self.audio_buffer, audio)
+        n = len(audio)
+        # Grow if needed (rare — only if buffer exceeds pre-alloc)
+        if self._buf_len + n > len(self._audio_buf):
+            new_size = max(len(self._audio_buf) * 2, self._buf_len + n)
+            new_buf = np.zeros(new_size, dtype=np.float32)
+            new_buf[:self._buf_len] = self._audio_buf[:self._buf_len]
+            self._audio_buf = new_buf
+        self._audio_buf[self._buf_len:self._buf_len + n] = audio
+        self._buf_len += n
 
     def prompt(self) -> tuple[str, str]:
         """Build prompt from committed text outside current buffer."""
@@ -222,15 +239,18 @@ class OnlineASRProcessor:
 
     def _chunk_at(self, time: float):
         self.transcript_buffer.pop_commited(time)
-        cut_seconds = time - self.buffer_time_offset
-        self.audio_buffer = self.audio_buffer[int(cut_seconds * SAMPLING_RATE):]
+        cut_samples = int((time - self.buffer_time_offset) * SAMPLING_RATE)
+        remaining = self._buf_len - cut_samples
+        if remaining > 0:
+            self._audio_buf[:remaining] = self._audio_buf[cut_samples:self._buf_len]
+        self._buf_len = max(0, remaining)
         self.buffer_time_offset = time
 
     def finish(self) -> tuple[float | None, float | None, str]:
         """Flush remaining uncommitted text."""
         o = self.transcript_buffer.complete()
         f = self._to_flush(o)
-        self.buffer_time_offset += len(self.audio_buffer) / SAMPLING_RATE
+        self.buffer_time_offset += self._buf_len / SAMPLING_RATE
         return f
 
     def get_speculative(self) -> str:

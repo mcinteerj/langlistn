@@ -72,18 +72,14 @@ class MicCapture:
             ) from e
 
     async def read_chunk(self) -> bytes | None:
-        """Read one chunk. Blocks briefly via asyncio executor."""
+        """Read one chunk. Non-blocking poll to avoid holding executor threads."""
         if self._stream and not self._stream.active:
             logger.warning("mic stream is no longer active (device disconnected?)")
             return None
-        loop = asyncio.get_event_loop()
         try:
-            data = await asyncio.wait_for(
-                loop.run_in_executor(None, self._queue.get, True, 2.0),
-                timeout=3.0,
-            )
-            return data
-        except (queue.Empty, asyncio.TimeoutError):
+            return self._queue.get_nowait()
+        except queue.Empty:
+            await asyncio.sleep(0.05)  # yield to event loop
             return None
 
     async def stop(self) -> tuple[int, str]:
