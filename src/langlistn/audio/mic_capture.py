@@ -72,7 +72,11 @@ class MicCapture:
             ) from e
 
     async def read_chunk(self) -> bytes | None:
-        """Read one chunk. Non-blocking poll to avoid holding executor threads."""
+        """Read one chunk. Non-blocking poll to avoid holding executor threads.
+
+        Returns None only when the stream has died (device disconnected).
+        Returns empty bytes b'' when no audio is available yet.
+        """
         if self._stream and not self._stream.active:
             logger.warning("mic stream is no longer active (device disconnected?)")
             return None
@@ -80,7 +84,7 @@ class MicCapture:
             return self._queue.get_nowait()
         except queue.Empty:
             await asyncio.sleep(0.05)  # yield to event loop
-            return None
+            return b""
 
     async def stop(self) -> tuple[int, str]:
         if self._stream:

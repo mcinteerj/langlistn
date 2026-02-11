@@ -297,6 +297,8 @@ async def run_pipeline(
             chunk = await source.read_chunk()
             if chunk is None:
                 break
+            if len(chunk) == 0:
+                continue
             rms = _rms_int16(chunk)
             if rms < SILENCE_RMS_THRESHOLD:
                 vad_cooldown = 0  # silence resets cooldown
@@ -555,9 +557,10 @@ async def run_pipeline(
         tasks = [
             asyncio.create_task(audio_loop()),
             asyncio.create_task(whisper_loop()),
-            asyncio.create_task(translate_loop()),
             asyncio.create_task(shutdown.wait()),
         ]
+        if translator:
+            tasks.append(asyncio.create_task(translate_loop()))
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for t in pending:
             t.cancel()
