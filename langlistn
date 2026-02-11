@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Get script directory (handles symlinks)
+SCRIPT_DIR="$(python3 -c "import os; print(os.path.dirname(os.path.realpath('${BASH_SOURCE[0]}')))")"
+
+# Load .env if present
+if [ -f "$SCRIPT_DIR/.env" ]; then
+    set -a
+    source "$SCRIPT_DIR/.env"
+    set +a
+fi
+
+# Create venv if needed
+if [ ! -f "$SCRIPT_DIR/.venv/bin/python" ]; then
+    echo "Installing langlistn..." >&2
+    python3 -m venv "$SCRIPT_DIR/.venv"
+    "$SCRIPT_DIR/.venv/bin/pip" install -q --upgrade pip
+    "$SCRIPT_DIR/.venv/bin/pip" install -q -e "$SCRIPT_DIR"
+fi
+
+# Build Swift helper if needed
+SWIFT_BIN="$SCRIPT_DIR/swift/.build/release/AudioCaptureHelper"
+if [ ! -f "$SWIFT_BIN" ]; then
+    echo "Building Swift audio capture helper..." >&2
+    bash "$SCRIPT_DIR/swift/build.sh"
+fi
+
+# Execute
+exec "$SCRIPT_DIR/.venv/bin/python" -m langlistn "$@"

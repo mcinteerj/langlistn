@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.build/
+swift/AudioCaptureHelper/.build/
+swift/.build/
+.env
+.DS_Store
+AGENTS.md
+AGENTS.local.md
