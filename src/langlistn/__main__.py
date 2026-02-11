@@ -4,6 +4,7 @@ import os
 
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["TQDM_DISABLE"] = "1"
+os.environ.setdefault("KMP_WARNINGS", "off")  # suppress OMP deprecation messages
 
 
 try:
