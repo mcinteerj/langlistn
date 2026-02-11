@@ -167,6 +167,10 @@ class TranslateApp(App):
     async def _run_background(self) -> None:
         """Connect API and run audio + receive + watchdog concurrently."""
         try:
+            # Start audio capture FIRST — subprocess must be created before
+            # mlx/torch imports can taint the file descriptor table
+            self.set_status("starting audio capture...")
+            await self._audio_source.start()
             self.set_status("connecting to API...")
             await self._session.connect()
             await asyncio.gather(
@@ -183,8 +187,6 @@ class TranslateApp(App):
     async def _audio_loop(self) -> None:
         """Read audio chunks and send to API."""
         try:
-            self.set_status("starting audio capture...")
-            await self._audio_source.start()
             self.set_status("audio capture started · streaming")
             chunk_count = 0
             while True:

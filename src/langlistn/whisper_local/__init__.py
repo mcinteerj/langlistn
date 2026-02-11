@@ -4,7 +4,13 @@ import array
 import asyncio
 import logging
 import math
+import os
 import time
+
+# Prevent torch multiprocessing from inheriting file descriptors
+# which causes "bad value(s) in fds_to_keep" inside Textual's event loop
+os.environ.setdefault("TORCH_NUM_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
 from collections import deque
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
