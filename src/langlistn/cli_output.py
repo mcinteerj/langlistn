@@ -40,6 +40,9 @@ def _wrap_text(text: str, width: int) -> list[str]:
     return lines
 
 
+MAX_SPEC_LINES = 6  # Cap speculative display to avoid runaway overwrites
+
+
 class TerminalDisplay:
     """Live terminal output — confirmed text scrolls up, speculative gets overwritten."""
 
@@ -47,6 +50,7 @@ class TerminalDisplay:
         self.width = shutil.get_terminal_size().columns
         self.plain = plain
         self._spec_lines_on_screen = 0
+        self._recent_confirmed: list[str] = []  # dedup buffer
 
     def _erase_speculative(self):
         if self.plain:
@@ -59,6 +63,14 @@ class TerminalDisplay:
         """Print confirmed translation. If original provided, show above."""
         if not text.strip():
             return
+        # Dedup: skip if we recently confirmed the same text
+        normalized = text.strip().lower()
+        if normalized in self._recent_confirmed:
+            return
+        self._recent_confirmed.append(normalized)
+        # Keep last 10 for dedup window
+        if len(self._recent_confirmed) > 10:
+            self._recent_confirmed = self._recent_confirmed[-10:]
         self._erase_speculative()
         if self.plain:
             if original:
@@ -87,7 +99,7 @@ class TerminalDisplay:
                 sys.stdout.write(f"{DIM}{line}{RESET}\n")
             count += len(lines)
         if text.strip():
-            lines = _wrap_text(text, self.width - 1)
+            lines = _wrap_text(text, self.width - 1)[:MAX_SPEC_LINES]
             for line in lines:
                 sys.stdout.write(f"{DIM}{line}{RESET}\n")
             count += len(lines)

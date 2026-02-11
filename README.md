@@ -1,33 +1,22 @@
 # langlistn
 
-Real-time audio to English text. Captures audio from any macOS app or microphone, streams it to OpenAI's Realtime API, and displays rolling English text in a terminal UI.
+Real-time audio translation to English, running locally on your Mac. Point it at any app or microphone and get live English text — no API keys, no cloud, no cost.
 
-Transcribes English speech directly. Translates foreign languages into English automatically. Built for following meetings, calls, or videos — just point it at an app and go.
+Powered by [Whisper](https://github.com/openai/whisper) via [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper) on Apple Silicon.
 
-> **macOS 15+** · **Python 3.11+** · **Azure OpenAI** with `gpt-realtime-mini` or `gpt-realtime`
+> **macOS 15+** · **Apple Silicon (M1+)** · **Python 3.11+**
 
 ## How it works
 
-```mermaid
-flowchart TD
-    A["🎧 App or Mic"] -->|audio| B["Swift Helper<br/>ScreenCaptureKit<br/>anti-alias + resample"]
-    B -->|16kHz PCM16| C["Python<br/>silence gate<br/>upsample to 24kHz"]
-    C -->|WebSocket| D["OpenAI Realtime API<br/>VAD + Whisper + GPT"]
-    D -->|streaming text| E["Terminal UI<br/>live translation<br/>cost tracking"]
+```
+App/Mic audio → Swift helper (ScreenCaptureKit) → 16kHz PCM
+    → sliding window (20s, 5s step) → Whisper large-v3 (local)
+    → confirmed/speculative display → terminal
 ```
 
-**Swift** captures per-app audio via ScreenCaptureKit, applies an anti-alias filter, and resamples to 16kHz PCM16 mono. **Python** skips silence, upsamples to 24kHz (OpenAI requirement), and streams over WebSocket. **OpenAI** handles voice activity detection, transcription, and translation when needed. The **TUI** streams text word-by-word as it arrives.
+Audio is captured per-app via ScreenCaptureKit, buffered into overlapping 20-second windows, and translated by Whisper running locally on your GPU. Text appears as **confirmed** (bold — seen in two consecutive windows) or *speculative* (dim — may change). Speculative text is overwritten in-place as new audio arrives.
 
 ## Quick start
-
-### Prerequisites
-
-- macOS 15+
-- Xcode Command Line Tools: `xcode-select --install`
-- Python 3.11+
-- An Azure OpenAI account with a `gpt-realtime-mini` (or `gpt-realtime`) deployment
-
-### 1. Clone and install
 
 ```bash
 git clone https://github.com/mcinteerj/langlistn.git
@@ -37,73 +26,36 @@ python3 -m venv .venv
 bash swift/build.sh
 ```
 
-### 2. Configure Azure OpenAI
-
-1. In [Azure OpenAI Studio](https://oai.azure.com/), deploy a **Realtime** model
-2. Name the deployment `gpt-realtime-mini` (default) or `gpt-realtime`, or use `--deployment` to override
-3. Copy your API key and endpoint URL
+Grant your terminal **Screen & System Audio Recording** permissions in System Settings → Privacy & Security. Restart your terminal after.
 
 ```bash
-cp .env.example .env
-# Edit .env:
-#   AZURE_OPENAI_API_KEY=your-key
-#   OPENAI_API_BASE=https://your-resource.openai.azure.com/
-```
-
-Or export directly:
-
-```bash
-export AZURE_OPENAI_API_KEY="your-key"
-export OPENAI_API_BASE="https://your-resource.openai.azure.com/"
-```
-
-### 3. Grant macOS permissions
-
-Your terminal app needs **two separate permissions** in System Settings → Privacy & Security:
-
-1. **Screen & System Audio Recording** — lets the helper attach to app audio streams
-2. **System Audio Recording Only** — required additionally on macOS 15
-
-**Restart your terminal after granting permissions.**
-
-### 4. Run
-
-```bash
-.venv/bin/langlistn --app "Google Chrome"
-```
-
-Or activate the venv first:
-
-```bash
-source .venv/bin/activate
 langlistn --app "Google Chrome"
 ```
 
+That's it. First run downloads the Whisper model (~3GB). Subsequent runs start in a few seconds.
+
 ## Usage
 
-### App audio capture
+### App audio
 
 ```bash
-# Auto-detect language — just point at any app
 langlistn --app "Google Chrome"
 langlistn --app "zoom.us"
 langlistn --app "Microsoft Teams"
 langlistn --app "Spotify"
-langlistn --app "Safari"
 langlistn --app "Discord"
 ```
 
-### Source language hints
+### Language hints
 
-Auto-detection works well, but hinting improves accuracy for specific languages:
+Auto-detection works, but hinting the source language improves speed and accuracy:
 
 ```bash
 langlistn --app "Google Chrome" --source ko     # Korean
-langlistn --app "Google Chrome" --source ja     # Japanese
-langlistn --app "zoom.us" --source zh           # Mandarin
-langlistn --app "Microsoft Teams" --source fr   # French
-langlistn --app "zoom.us" --source de           # German
-langlistn --app "Google Chrome" --source es     # Spanish
+langlistn --app "zoom.us" --source ja            # Japanese
+langlistn --app "Microsoft Teams" --source zh    # Mandarin
+langlistn --app "Google Chrome" --source fr      # French
+langlistn --app "Google Chrome" --source de      # German
 ```
 
 <details>
@@ -111,20 +63,41 @@ langlistn --app "Google Chrome" --source es     # Spanish
 
 `ko` Korean · `ja` Japanese · `zh` Mandarin · `zh-yue` Cantonese · `th` Thai · `vi` Vietnamese · `fr` French · `de` German · `es` Spanish · `ar` Arabic · `hi` Hindi · `pt` Portuguese · `it` Italian · `ru` Russian · `id` Indonesian · `ms` Malay · `tl` Tagalog
 
-Auto-detects any language Whisper supports — these codes are hints, not requirements.
+Whisper supports 99 languages — these codes are hints, not requirements.
 </details>
 
-### Microphone capture
+### Microphone
 
 ```bash
-# Default microphone
 langlistn --mic
-
-# Specific microphone
 langlistn --mic --device "MacBook Pro Microphone"
+langlistn --mic --source ko
+```
 
-# Mic with language hint
-langlistn --mic --source de
+### Dual language
+
+Show the original language alongside the English translation:
+
+```bash
+langlistn --app "Google Chrome" --dual-lang
+langlistn --app "zoom.us" --source ko --dual-lang
+```
+
+Original text appears dim above the bold English translation.
+
+### Pipe-friendly output
+
+Strip all ANSI formatting and speculative text — only confirmed translations:
+
+```bash
+langlistn --app "Google Chrome" --plain | tee meeting.txt
+langlistn --app "zoom.us" --plain --source ja > transcript.txt
+```
+
+### Logging
+
+```bash
+langlistn --app "Google Chrome" --log meeting.txt
 ```
 
 ### Discovery
@@ -134,62 +107,94 @@ langlistn --list-apps       # Show capturable apps (must be running)
 langlistn --list-devices    # Show audio input devices
 ```
 
-### Combining options
+## Model selection
+
+The model is auto-selected based on your Mac's RAM:
+
+| RAM | Model | Size | Speed (M4 Max) |
+|-----|-------|------|-----------------|
+| 32GB+ | `whisper-large-v3` | 3GB | ~1.5s per 20s window |
+| 16GB | `whisper-large-v3` | 3GB | ~2-3s per 20s window |
+| 12GB | `whisper-medium` | 1.5GB | ~1-2s per 20s window |
+| 8GB | `whisper-small` | 500MB | ~0.5-1s per 20s window |
+
+Override with `--model`:
 
 ```bash
-# Full example: Korean source, show original text, log to file
-langlistn --app "Google Chrome" --source ko --transcript --log meeting.txt
-
-# Use the full model for higher quality
-langlistn --app "Google Chrome" --deployment gpt-realtime
+langlistn --app "Google Chrome" --model mlx-community/whisper-large-v3-mlx
+langlistn --app "Google Chrome" --model mlx-community/whisper-medium-mlx
 ```
 
-### TUI keybindings
+## How the sliding window works
 
-| Key | Action |
-|-----|--------|
-| `q` | Quit |
-| `o` | Toggle original language text (Whisper transcription) |
-| `l` | Toggle file logging |
-| `c` | Clear display |
-| `Ctrl+p` | Theme palette |
+```
+Audio timeline:
+|----5s----|----5s----|----5s----|----5s----|
+0          5          10         15         20
 
-## Cost
+Window 1 (at t=20s):
+|==================== 20s ====================|
+0                                             20
 
-> **⚠️ Cost warning:** langlistn streams audio to OpenAI's Realtime API, which bills per token. With `gpt-realtime-mini` (default), expect roughly **$0.10–0.20/minute** — a 1-hour session costs **~$6–12**. The full `gpt-realtime` model is ~10× more expensive. Silence is detected client-side and not sent, which helps. Monitor costs in the status bar and your Azure dashboard.
+Window 2 (at t=25s):    5s step →
+          |==================== 20s ====================|
+          5                                             25
+
+Each window:
+  [0-10s]  already confirmed → skip
+  [10-15s] was speculative last time → CONFIRM (bold)
+  [15-20s] new audio → speculative (dim, overwritten next cycle)
+```
+
+Longer windows give Whisper more context, dramatically improving translation quality. The 15-second overlap between consecutive windows means each piece of audio is seen multiple times before being confirmed.
+
+## Remote API mode
+
+For streaming via Azure OpenAI Realtime API (requires API key, costs ~$0.10-0.20/min):
+
+```bash
+pip install "langlistn[remote]"
+
+export AZURE_OPENAI_API_KEY="your-key"
+export OPENAI_API_BASE="https://your-resource.openai.azure.com/"
+
+langlistn --app "Google Chrome" --remote
+langlistn --app "Google Chrome" --remote --deployment gpt-realtime
+```
 
 ## Troubleshooting
 
 | Problem | Fix |
 |---------|-----|
-| **No audio / silence** | Grant both permissions in System Settings (Screen Recording AND System Audio Recording). Restart terminal. |
-| **`AZURE_OPENAI_API_KEY not set`** | Add to `.env` or export in your shell. |
-| **`OPENAI_API_BASE not set`** | Set your Azure endpoint URL in `.env` or environment. |
-| **`API key rejected`** | Verify key and endpoint in Azure OpenAI Studio. |
+| **No audio / silence** | Grant both Screen Recording AND System Audio Recording permissions. Restart terminal. |
 | **Swift build fails** | Install Xcode Command Line Tools: `xcode-select --install` |
 | **App not in `--list-apps`** | The app must be running and producing audio. |
-| **Mic permission denied** | Grant microphone access to your terminal in System Settings → Privacy & Security → Microphone. |
-| **Reconnect loop** | Check API key, endpoint URL, and deployment name. Verify deployment is active. |
+| **Slow first run** | Model download (~3GB for large-v3). Cached after first run. |
+| **Out of memory** | Use a smaller model: `--model mlx-community/whisper-small-mlx` |
+| **Hallucination loops** | Built-in detection suppresses these. Try adding `--source` hint. |
+| **Intel Mac** | Not supported. mlx-whisper requires Apple Silicon (M1+). |
 
 ## Project structure
 
 ```
 langlistn/
 ├── pyproject.toml
-├── .env.example
 ├── src/langlistn/
-│   ├── __main__.py         # CLI entry point
-│   ├── app.py              # Async orchestrator
-│   ├── config.py           # Prompts, languages, constants
+│   ├── __main__.py           # CLI entry point
+│   ├── cli_output.py         # Terminal output with ANSI overwriting
+│   ├── app.py                # Async orchestrator (TUI/remote mode)
+│   ├── config.py             # Languages, constants, prompts
 │   ├── audio/
-│   │   ├── __init__.py     # App capture (ScreenCaptureKit)
-│   │   └── mic_capture.py  # Mic capture (sounddevice)
+│   │   ├── __init__.py       # App capture (ScreenCaptureKit)
+│   │   └── mic_capture.py    # Mic capture (sounddevice)
+│   ├── whisper_local/
+│   │   └── __init__.py       # Local Whisper session (sliding window)
 │   ├── realtime/
-│   │   └── __init__.py     # OpenAI Realtime API session
+│   │   └── __init__.py       # Azure OpenAI Realtime API session
 │   └── tui/
-│       └── __init__.py     # Terminal UI (Textual)
+│       └── __init__.py       # Terminal UI (Textual, optional)
 └── swift/
-    └── AudioCaptureHelper/ # Swift ScreenCaptureKit helper
+    └── AudioCaptureHelper/   # Swift ScreenCaptureKit helper
 ```
 
 ## License

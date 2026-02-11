@@ -2,8 +2,6 @@
 
 import os
 
-# Prevent tqdm/huggingface from spawning multiprocessing resource tracker
-# which fails inside Textual due to non-inheritable FDs.
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["TQDM_DISABLE"] = "1"
 
@@ -27,21 +25,24 @@ def main():
 
     parser = argparse.ArgumentParser(
         prog="langlistn",
-        description="Real-time audio translation to English.",
+        description="Real-time audio translation to English. Runs locally with Whisper by default — free, offline, no API key needed.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 examples:
-  # Local whisper (free, offline)
-  langlistn --app "Google Chrome" --local
-  langlistn --app "Google Chrome" --local --source ko
-  langlistn --app "Google Chrome" --local --dual-lang
-
-  # Pipe-friendly (no ANSI, only confirmed text)
-  langlistn --app "Google Chrome" --local --plain | tee meeting.txt
-
-  # Cloud API mode
+  # Translate app audio (local Whisper, default)
   langlistn --app "Google Chrome"
-  langlistn --app "zoom.us" --source ja
+  langlistn --app "zoom.us" --source ko
+  langlistn --app "Microsoft Teams" --dual-lang
+
+  # Microphone
+  langlistn --mic
+  langlistn --mic --source ja
+
+  # Pipe-friendly (no ANSI, confirmed text only)
+  langlistn --app "Google Chrome" --plain | tee meeting.txt
+
+  # Azure OpenAI Realtime API (streaming, costs money)
+  langlistn --app "Google Chrome" --remote
 
   # Discovery
   langlistn --list-apps
@@ -61,28 +62,28 @@ examples:
     # Common options
     parser.add_argument("--device", metavar="NAME", help="Microphone device name (with --mic)")
     parser.add_argument("--source", metavar="CODE", dest="lang",
-                        help="Source language hint (ko, ja, zh, etc). Improves accuracy. Auto-detected if omitted.")
+                        help="Source language hint (ko, ja, zh, fr, de, etc). Improves speed and accuracy.")
     parser.add_argument("--log", metavar="FILE", help="Save translations to file")
 
-    # Local whisper options
-    local_group = parser.add_argument_group("local whisper (--local)")
-    local_group.add_argument("--local", action="store_true",
-                             help="Use local Whisper — free, offline, no API key needed")
+    # Local whisper options (default mode)
+    local_group = parser.add_argument_group("local whisper (default)")
     local_group.add_argument("--model", metavar="NAME", default=None,
                              help="Whisper model (default: auto-select based on RAM)")
     local_group.add_argument("--dual-lang", action="store_true",
                              help="Show original language above English translation")
     local_group.add_argument("--plain", action="store_true",
-                             help="Pipe-friendly output — no ANSI, no speculative text, just confirmed translations")
-    local_group.add_argument("--tui", action="store_true",
-                             help="Use full TUI instead of terminal output")
+                             help="Pipe-friendly — no ANSI, no speculative, just confirmed text")
 
-    # Cloud API options
-    cloud_group = parser.add_argument_group("cloud API (default)")
-    cloud_group.add_argument("--deployment", metavar="NAME", default="gpt-realtime-mini",
-                             help="Azure OpenAI deployment (default: gpt-realtime-mini)")
-    cloud_group.add_argument("--transcript", action="store_true",
-                             help="Show source-language transcript")
+    # Remote API options
+    remote_group = parser.add_argument_group("remote API (--remote)")
+    remote_group.add_argument("--remote", action="store_true",
+                              help="Use Azure OpenAI Realtime API instead of local Whisper")
+    remote_group.add_argument("--deployment", metavar="NAME", default="gpt-realtime-mini",
+                              help="Azure deployment name (default: gpt-realtime-mini)")
+    remote_group.add_argument("--transcript", action="store_true",
+                              help="Show source-language transcript (remote only)")
+    remote_group.add_argument("--tui", action="store_true",
+                              help="Use full TUI (remote default, optional for local)")
 
     # Output
     parser.add_argument("--json", dest="output_json", action="store_true", help="JSON output (for --list-*)")
@@ -115,7 +116,24 @@ examples:
         parser.error("Must specify --app NAME or --mic (see --list-apps / --list-devices)")
 
     try:
-        if args.local and not args.tui:
+        if args.remote or args.tui:
+            # Remote API mode (or TUI mode for local)
+            from .app import run_app
+            asyncio.run(
+                run_app(
+                    app_name=args.app,
+                    mic=args.mic,
+                    device=args.device,
+                    lang=args.lang,
+                    deployment=args.deployment,
+                    log_path=args.log,
+                    show_transcript=args.transcript,
+                    local=not args.remote,
+                    model=args.model or "mlx-community/whisper-large-v3-mlx",
+                )
+            )
+        else:
+            # Local whisper with terminal output (default)
             from .cli_output import run_cli
             asyncio.run(
                 run_cli(
@@ -127,21 +145,6 @@ examples:
                     log_path=args.log,
                     plain=args.plain,
                     dual_lang=args.dual_lang,
-                )
-            )
-        else:
-            from .app import run_app
-            asyncio.run(
-                run_app(
-                    app_name=args.app,
-                    mic=args.mic,
-                    device=args.device,
-                    lang=args.lang,
-                    deployment=args.deployment,
-                    log_path=args.log,
-                    show_transcript=args.transcript,
-                    local=args.local,
-                    model=args.model or "mlx-community/whisper-large-v3-mlx",
                 )
             )
     except KeyboardInterrupt:
