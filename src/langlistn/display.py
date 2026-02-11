@@ -19,6 +19,22 @@ RESET = "\033[0m"
 CLEAR_LINE = "\033[2K"
 MOVE_UP = "\033[A"
 
+SPEAKER_COLOURS = [
+    "\033[36m",  # cyan
+    "\033[33m",  # yellow
+    "\033[32m",  # green
+    "\033[35m",  # magenta
+    "\033[34m",  # blue
+    "\033[91m",  # bright red
+]
+
+_ANSI_RE = re.compile(r'\033\[[0-9;]*m')
+
+
+def _visible_len(s: str) -> int:
+    """Length of string excluding ANSI escape sequences."""
+    return len(_ANSI_RE.sub('', s))
+
 # Sentence-ending punctuation pattern
 _SENTENCE_END = re.compile(r'([.!?。！？…])\s+')
 
@@ -53,7 +69,7 @@ def _wrap_lines(text: str, width: int) -> list[str]:
         words = paragraph.split()
         current = ""
         for word in words:
-            if current and len(current) + 1 + len(word) > width:
+            if current and _visible_len(current) + 1 + _visible_len(word) > width:
                 out.append(current)
                 current = word
             else:
@@ -113,7 +129,7 @@ class TerminalDisplay:
             if speculative.strip():
                 # Render last locked line bold, then speculative continues
                 # on the same line in dim italic
-                remaining_width = w - len(last_locked_line) - 1
+                remaining_width = w - _visible_len(last_locked_line) - 1
                 spec_text = speculative.strip()
 
                 if remaining_width > 5:
@@ -122,7 +138,7 @@ class TerminalDisplay:
                     same_line = ""
                     rest_words = []
                     for i, word in enumerate(spec_words):
-                        if same_line and len(same_line) + 1 + len(word) > remaining_width:
+                        if same_line and _visible_len(same_line) + 1 + _visible_len(word) > remaining_width:
                             rest_words = spec_words[i:]
                             break
                         same_line = f"{same_line} {word}" if same_line else word
