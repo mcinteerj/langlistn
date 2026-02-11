@@ -1,4 +1,9 @@
-"""OpenAI Realtime API session — audio in, text out."""
+"""OpenAI Realtime API session — audio in, text out.
+
+Uses manual turn detection (no server VAD) to prevent the API from
+cancelling in-progress responses when new speech arrives.  Client-side
+silence detection decides when to commit audio and request a response.
+"""
 
 import array
 import asyncio
@@ -18,12 +23,11 @@ import websockets.exceptions
 from ..config import (
     BACKOFF_INITIAL,
     BACKOFF_MAX,
+    CLIENT_VAD_MIN_SPEECH_CHUNKS,
+    CLIENT_VAD_SILENCE_CHUNKS,
     MAX_SPEECH_DURATION_S,
-    PREFIX_PADDING_MS,
     RECONNECT_BUFFER_MAX,
-    SILENCE_DURATION_MS,
     SILENCE_RMS_THRESHOLD,
-    VAD_THRESHOLD,
     build_system_prompt,
 )
 
@@ -67,7 +71,6 @@ DEFAULT_PRICING = MODEL_PRICING["gpt-realtime-mini"]
 def _resolve_pricing(deployment: str) -> dict[str, float]:
     """Match deployment name to pricing. Falls back to mini pricing."""
     dep = deployment.lower()
-    # Check mini first to avoid "gpt-realtime" matching before "gpt-realtime-mini"
     if "mini" in dep:
         return MODEL_PRICING["gpt-realtime-mini"]
     if "realtime" in dep:
@@ -82,17 +85,16 @@ class SessionStats:
     audio_bytes_sent: int = 0
     silence_chunks_skipped: int = 0
     responses_received: int = 0
+    responses_cancelled: int = 0
     speech_detected: int = 0
     connect_time: float = 0
     last_speech_time: float = 0
-    # Token tracking for cost estimation
     input_tokens: int = 0
     output_tokens: int = 0
     audio_input_tokens: int = 0
     audio_output_tokens: int = 0
     text_input_tokens: int = 0
     text_output_tokens: int = 0
-    # Resolved pricing
     pricing: dict[str, float] = field(default_factory=lambda: DEFAULT_PRICING)
 
     @property
@@ -137,7 +139,7 @@ def _upsample_16_to_24(chunk: bytes) -> bytes:
     n = len(samples)
     if n == 0:
         return b""
-    out_len = (n * 3 + 1) // 2  # ceiling division for 1.5x
+    out_len = (n * 3 + 1) // 2
     resampled = array.array("h", bytes(out_len * 2))
     for i in range(out_len):
         src = i * 2.0 / 3.0
@@ -152,7 +154,12 @@ def _upsample_16_to_24(chunk: bytes) -> bytes:
 
 
 class RealtimeSession:
-    """Manages OpenAI Realtime API WebSocket connection."""
+    """Manages OpenAI Realtime API WebSocket connection.
+
+    Uses turn_detection=null (manual mode) so that incoming audio never
+    causes the API to cancel in-progress translation responses.  Speech
+    boundaries are detected client-side via RMS silence gating.
+    """
 
     def __init__(
         self,
@@ -173,6 +180,13 @@ class RealtimeSession:
         self._send_lock = asyncio.Lock()
         self._last_commit_time: float = 0.0
         self._has_pending_audio: bool = False
+        # Client-side VAD state
+        self._speech_chunks: int = 0  # consecutive non-silent chunks
+        self._silence_chunks: int = 0  # consecutive silent chunks
+        self._in_speech: bool = False
+        # Track whether a response is in progress to avoid overlap
+        self._response_in_progress: bool = False
+        self._pending_commit: bool = False  # commit queued while response active
         self.stats = SessionStats(pricing=_resolve_pricing(deployment))
 
     def _get_url(self) -> str:
@@ -204,7 +218,6 @@ class RealtimeSession:
         try:
             self._event_queue.put_nowait(event)
         except asyncio.QueueFull:
-            # Drop oldest non-critical event
             try:
                 self._event_queue.get_nowait()
             except asyncio.QueueEmpty:
@@ -253,12 +266,7 @@ class RealtimeSession:
                 "input_audio_transcription": {
                     "model": "whisper-1",
                 },
-                "turn_detection": {
-                    "type": "server_vad",
-                    "threshold": VAD_THRESHOLD,
-                    "prefix_padding_ms": PREFIX_PADDING_MS,
-                    "silence_duration_ms": SILENCE_DURATION_MS,
-                },
+                "turn_detection": None,
             },
         }
         await self._ws.send(json.dumps(session_config))
@@ -276,14 +284,32 @@ class RealtimeSession:
     async def send_audio(self, chunk: bytes) -> None:
         """Send 16kHz PCM16 audio, upsampled to 24kHz for OpenAI.
 
-        Silences are detected client-side and skipped to save API costs.
+        Also runs client-side VAD: when silence follows speech, commits
+        the buffer and requests a translation response.
         """
-        # Client-side silence gate
         rms = _rms_int16(chunk)
-        if rms < SILENCE_RMS_THRESHOLD:
-            self.stats.silence_chunks_skipped += 1
-            return
+        is_speech = rms >= SILENCE_RMS_THRESHOLD
 
+        if is_speech:
+            self._silence_chunks = 0
+            self._speech_chunks += 1
+            if not self._in_speech:
+                self._in_speech = True
+                self.stats.speech_detected += 1
+                self.stats.last_speech_time = time.time()
+        else:
+            self._silence_chunks += 1
+            # Check if speech just ended
+            if self._in_speech and self._silence_chunks >= CLIENT_VAD_SILENCE_CHUNKS:
+                if self._speech_chunks >= CLIENT_VAD_MIN_SPEECH_CHUNKS:
+                    await self._commit_and_respond()
+                self._in_speech = False
+                self._speech_chunks = 0
+            if not self._in_speech:
+                self.stats.silence_chunks_skipped += 1
+                return
+
+        # Send audio to API
         async with self._send_lock:
             if self._buffering or not self._connected or not self._ws:
                 self._audio_buffer.append(chunk)
@@ -308,6 +334,41 @@ class RealtimeSession:
                 if not self._shutdown:
                     asyncio.get_running_loop().create_task(self._reconnect())
 
+    async def _commit_and_respond(self) -> None:
+        """Commit audio buffer and request a translation response.
+
+        If a response is already in progress, queues the commit so it
+        fires as soon as the current response finishes.
+        """
+        async with self._send_lock:
+            if not self._connected or not self._ws or not self._has_pending_audio:
+                return
+            if self._response_in_progress:
+                self._pending_commit = True
+                logger.debug("response in progress — queued commit")
+                return
+            try:
+                await self._ws.send(
+                    json.dumps({"type": "input_audio_buffer.commit"})
+                )
+                await self._ws.send(
+                    json.dumps({"type": "response.create"})
+                )
+                self._has_pending_audio = False
+                self._response_in_progress = True
+                self._last_commit_time = time.time()
+                logger.debug("committed audio + requested response")
+            except (websockets.exceptions.ConnectionClosed, ConnectionError, OSError):
+                pass
+
+    async def _flush_pending_commit(self) -> None:
+        """If a commit was queued while response was active, fire it now."""
+        if self._pending_commit and self._has_pending_audio:
+            self._pending_commit = False
+            await self._commit_and_respond()
+        else:
+            self._pending_commit = False
+
     async def _flush_buffer(self) -> None:
         """Replay buffered audio after reconnect."""
         if self._flushing:
@@ -316,7 +377,6 @@ class RealtimeSession:
         try:
             while self._audio_buffer and self._connected and not self._shutdown:
                 chunk = self._audio_buffer.popleft()
-                # Inline send to avoid recursion through send_audio → _reconnect
                 try:
                     out_data = _upsample_16_to_24(chunk)
                     if not out_data:
@@ -356,19 +416,18 @@ class RealtimeSession:
                 await self._emit(EventKind.STATUS, self.stats.status_line())
                 return
             except ValueError as e:
-                # Auth errors — don't retry
                 await self._emit(EventKind.ERROR, str(e))
                 return
             except Exception as e:
                 if attempt == max_retries:
                     await self._emit(
-                        "error",
-                        f"reconnect failed after {max_retries} attempts — restart langlistn"
+                        EventKind.ERROR,
+                        f"reconnect failed after {max_retries} attempts — restart langlistn",
                     )
                     return
                 await self._emit(
-                    "status",
-                    f"reconnect failed ({attempt}/{max_retries}), retry in {delay:.0f}s"
+                    EventKind.STATUS,
+                    f"reconnect failed ({attempt}/{max_retries}), retry in {delay:.0f}s",
                 )
                 logger.warning("reconnect attempt %d failed: %s", attempt, e)
                 await asyncio.sleep(delay)
@@ -376,18 +435,10 @@ class RealtimeSession:
 
     async def force_commit(self) -> None:
         """Force commit the audio buffer to trigger a response."""
-        async with self._send_lock:
-            if not self._connected or not self._ws or not self._has_pending_audio:
-                return
-            try:
-                await self._ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-                self._has_pending_audio = False
-                self._last_commit_time = time.time()
-            except (websockets.exceptions.ConnectionClosed, ConnectionError, OSError):
-                pass
+        await self._commit_and_respond()
 
     async def commit_watchdog(self) -> None:
-        """Force commit if no VAD-triggered commit within MAX_SPEECH_DURATION_S."""
+        """Force commit if continuous speech exceeds MAX_SPEECH_DURATION_S."""
         try:
             while not self._shutdown:
                 await asyncio.sleep(1.0)
@@ -395,7 +446,9 @@ class RealtimeSession:
                     continue
                 elapsed = time.time() - self._last_commit_time
                 if elapsed >= MAX_SPEECH_DURATION_S:
-                    await self.force_commit()
+                    await self._commit_and_respond()
+                    # Reset client VAD state for fresh segment
+                    self._speech_chunks = 0
         except asyncio.CancelledError:
             pass
 
@@ -416,62 +469,59 @@ class RealtimeSession:
 
                     etype = event.get("type", "")
 
-                    # Streaming text delta from model
                     if etype == "response.text.delta":
                         delta = event.get("delta", "")
                         if delta:
                             await self._emit(EventKind.TEXT, delta)
 
-                    # Response done
                     elif etype == "response.done":
-                        self.stats.responses_received += 1
-                        self._last_commit_time = time.time()
-                        self._has_pending_audio = False
-                        # Extract token usage for cost tracking
                         resp = event.get("response", {})
+                        status = resp.get("status", "")
+                        if status == "cancelled":
+                            self.stats.responses_cancelled += 1
+                            logger.debug("response cancelled by API")
+                        else:
+                            self.stats.responses_received += 1
+                        self._response_in_progress = False
+                        self._last_commit_time = time.time()
                         usage = resp.get("usage", {})
                         if usage:
                             self.stats.input_tokens += usage.get("input_tokens", 0)
                             self.stats.output_tokens += usage.get("output_tokens", 0)
-                            inp_detail = usage.get("input_token_details", {})
-                            out_detail = usage.get("output_token_details", {})
-                            self.stats.audio_input_tokens += inp_detail.get("audio_tokens", 0)
-                            self.stats.text_input_tokens += inp_detail.get("text_tokens", 0)
-                            self.stats.audio_output_tokens += out_detail.get("audio_tokens", 0)
-                            self.stats.text_output_tokens += out_detail.get("text_tokens", 0)
+                            inp = usage.get("input_token_details", {})
+                            out = usage.get("output_token_details", {})
+                            self.stats.audio_input_tokens += inp.get("audio_tokens", 0)
+                            self.stats.text_input_tokens += inp.get("text_tokens", 0)
+                            self.stats.audio_output_tokens += out.get("audio_tokens", 0)
+                            self.stats.text_output_tokens += out.get("text_tokens", 0)
                         await self._emit(EventKind.TURN_COMPLETE)
                         await self._emit(EventKind.STATUS, self.stats.status_line())
+                        # Fire any queued commit now that response is done
+                        await self._flush_pending_commit()
 
-                    # Input audio transcription
                     elif etype == "conversation.item.input_audio_transcription.completed":
                         transcript = event.get("transcript", "")
                         if transcript:
                             await self._emit(EventKind.TRANSCRIPT, transcript)
 
-                    # Speech detection
-                    elif etype == "input_audio_buffer.speech_started":
-                        self.stats.speech_detected += 1
-                        self.stats.last_speech_time = time.time()
-
-                    # VAD committed audio
                     elif etype == "input_audio_buffer.committed":
                         self._last_commit_time = time.time()
                         self._has_pending_audio = False
 
-                    # Session created/updated
                     elif etype in ("session.created", "session.updated"):
                         await self._emit(EventKind.STATUS, "listening")
 
-                    # Errors
                     elif etype == "error":
                         err = event.get("error", {})
                         msg = err.get("message", str(err))
                         code = err.get("code", "")
-                        if "rate" in code.lower() or "429" in msg:
+                        if "buffer" in msg.lower() and "small" in msg.lower():
+                            logger.debug("API buffer too small (harmless): %s", msg)
+                        elif "rate" in code.lower() or "429" in msg:
                             await self._emit(EventKind.ERROR, f"rate limited: {msg}")
                         else:
                             await self._emit(EventKind.ERROR, msg)
-                        logger.error("API error: code=%s msg=%s", code, msg)
+                            logger.error("API error: code=%s msg=%s", code, msg)
 
             except websockets.exceptions.ConnectionClosed as e:
                 logger.warning("WebSocket closed: %s", e)

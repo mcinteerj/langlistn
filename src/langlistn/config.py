@@ -10,16 +10,19 @@ RECONNECT_BUFFER_MAX = int(RECONNECT_BUFFER_SECONDS * SAMPLE_RATE / CHUNK_FRAMES
 BACKOFF_INITIAL = 1.0
 BACKOFF_MAX = 30.0
 
-# VAD tuning
-SILENCE_DURATION_MS = 500
-VAD_THRESHOLD = 0.3
-PREFIX_PADDING_MS = 100
-
 # Max seconds of continuous speech before forcing a commit
-MAX_SPEECH_DURATION_S = 10.0
+MAX_SPEECH_DURATION_S = 5.0
 
 # Client-side silence gate — RMS below this skips sending (int16 range)
-SILENCE_RMS_THRESHOLD = 50
+SILENCE_RMS_THRESHOLD = 30
+
+# Client-side VAD: consecutive silent chunks before we consider speech ended
+# Each chunk is ~64ms (1024 frames / 16kHz), so 5 chunks ≈ 320ms
+CLIENT_VAD_SILENCE_CHUNKS = 5
+
+# Minimum speech chunks before we consider it worth committing
+# Avoids committing on tiny noise bursts
+CLIENT_VAD_MIN_SPEECH_CHUNKS = 3
 
 LANGUAGE_MAP: dict[str, str] = {
     "ko": "Korean",

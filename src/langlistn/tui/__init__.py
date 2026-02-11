@@ -8,8 +8,6 @@ from datetime import timedelta
 from pathlib import Path
 
 from textual.app import App, ComposeResult
-from textual.containers import VerticalScroll
-
 from ..realtime import EventKind
 from textual.reactive import reactive
 from textual.widgets import Footer, RichLog, Static
@@ -75,28 +73,24 @@ class TranslateApp(App):
     Screen {
         layout: vertical;
     }
-    #scroll-area {
+    #output {
         height: 1fr;
         border: round $accent;
-        background: $background;
-    }
-    #output {
-        height: auto;
         padding: 0 1;
-        background: $background;
     }
     #live {
         height: auto;
+        max-height: 3;
         padding: 0 1;
         color: $text;
     }
     #status {
-        height: auto;
+        height: 1;
         text-align: center;
         color: $text-muted;
     }
     #header-info {
-        height: auto;
+        height: 1;
         text-align: center;
         color: $text;
     }
@@ -130,6 +124,7 @@ class TranslateApp(App):
         self._session = session
         self._audio_source = audio_source
         self._bg_tasks: list[asyncio.Task] = []
+        self._recent_lines: list[str] = []  # last N lines for dedup
         config = load_config()
         self.theme = config.get("theme", DEFAULT_THEME)
         if log_path:
@@ -155,9 +150,8 @@ class TranslateApp(App):
         target = "English"
         lang_display = f"{src} → {target}" if src else f"auto-detect → {target}"
         yield Static(f"langlistn ── {lang_display} ── {self._mode}", id="header-info")
-        with VerticalScroll(id="scroll-area"):
-            yield RichLog(id="output", wrap=True, highlight=True, markup=True, auto_scroll=False)
-            yield LiveText(id="live")
+        yield RichLog(id="output", wrap=True, highlight=True, markup=True, auto_scroll=True)
+        yield LiveText(id="live")
         yield StatusBar(id="status")
         yield Footer()
 
@@ -261,8 +255,6 @@ class TranslateApp(App):
         try:
             live = self.query_one("#live", LiveText)
             live.append(text)
-            scroll = self.query_one("#scroll-area", VerticalScroll)
-            scroll.scroll_end(animate=False)
         except Exception:
             pass
 
@@ -279,16 +271,27 @@ class TranslateApp(App):
         try:
             live = self.query_one("#live", LiveText)
             text = live.clear_text().strip()
-            # Drop incomplete speaker labels (e.g. bare "Speaker" or "Speaker 1:")
-            import re
-            cleaned = re.sub(r"^Speaker\s*\d*:?\s*$", "", text, flags=re.IGNORECASE).strip()
-            if cleaned:
-                log = self.query_one("#output", RichLog)
-                log.write(text)
-                scroll = self.query_one("#scroll-area", VerticalScroll)
-                scroll.scroll_end(animate=False)
+            if not text:
+                return
+            # Split on inline speaker labels so each gets its own line
+            # e.g. "Speaker 1: hello... Speaker 2: hi" → two lines
+            parts = re.split(r"\s+(?=Speaker\s+\d+:)", text)
+            log = self.query_one("#output", RichLog)
+            for part in parts:
+                line = part.strip()
+                # Drop incomplete speaker labels
+                cleaned = re.sub(r"^Speaker\s*\d*:?\s*$", "", line, flags=re.IGNORECASE).strip()
+                if not cleaned:
+                    continue
+                # Deduplicate against recent lines
+                if line in self._recent_lines:
+                    continue
+                self._recent_lines.append(line)
+                if len(self._recent_lines) > 10:
+                    self._recent_lines.pop(0)
+                log.write(line)
                 if self._log_file:
-                    self._log_file.write(text + "\n")
+                    self._log_file.write(line + "\n")
                     self._log_file.flush()
         except Exception:
             pass
