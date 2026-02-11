@@ -32,9 +32,9 @@ logger = logging.getLogger(__name__)
 
 from .audio import AudioSource
 from .config import SILENCE_RMS_THRESHOLD
-from .display import Spinner, TerminalDisplay, SPEAKER_COLOURS
+from .display import Spinner, TerminalDisplay
 from .streaming_asr import MLXWhisperASR, OnlineASRProcessor, SAMPLING_RATE
-from .diarize import SpeakerTracker
+
 from .translate import ContinuationTranslator
 
 
@@ -81,7 +81,7 @@ class PipelineConfig:
     dual_lang: bool = False
 
     # Diarization
-    diarize: bool = False
+
 
 
 def _rms_int16(chunk: bytes) -> float:
@@ -199,13 +199,8 @@ async def run_pipeline(
     sys.stdout.write(f"\033[2K\r")
     sys.stdout.flush()
 
-    # Speaker diarization (optional)
-    speaker_tracker = SpeakerTracker() if cfg.diarize else None
-
-    # Load whisper model + VAD + diarization
+    # Load whisper model + VAD
     loading_msg = f"loading {model_name} + VAD"
-    if speaker_tracker:
-        loading_msg += " + diarization"
 
     # Detect first-run: check if model files are cached locally
     hint = ""
@@ -227,29 +222,14 @@ async def run_pipeline(
 
     def _load():
         nonlocal load_error, vad_model
-        import warnings
-        import os
-        # Suppress noisy warnings from torch/torchaudio/pyannote/OMP during load
-        # Must redirect C-level fd 2 to catch OMP info messages
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            old_stderr_fd = os.dup(2)
-            devnull_fd = os.open(os.devnull, os.O_WRONLY)
-            os.dup2(devnull_fd, 2)
-            os.close(devnull_fd)
-            try:
-                asr.load()
-                vad_model = _load_vad()
-                logger.info("VAD model loaded")
-                if speaker_tracker:
-                    if not speaker_tracker.load():
-                        logger.warning("Diarization unavailable — continuing without")
-            except Exception as e:
-                load_error = e
-            finally:
-                os.dup2(old_stderr_fd, 2)
-                os.close(old_stderr_fd)
-                loop.call_soon_threadsafe(load_done.set)
+        try:
+            asr.load()
+            vad_model = _load_vad()
+            logger.info("VAD model loaded")
+        except Exception as e:
+            load_error = e
+        finally:
+            loop.call_soon_threadsafe(load_done.set)
 
     threading.Thread(target=_load, daemon=True).start()
     await load_done.wait()
@@ -276,8 +256,7 @@ async def run_pipeline(
     consecutive_timeouts = 0
     consecutive_hallucinations = 0  # track whisper hallucination streaks
     recent_whisper_hypotheses: list[str] = []  # last N raw whisper speculative outputs
-    prev_speaker: str | None = None
-    speaker_colour_map: dict[str, str] = {}  # speaker name → ANSI colour
+
 
     def _build_status() -> str:
         runtime = int(time.time() - start_time)
@@ -304,14 +283,13 @@ async def run_pipeline(
                     continue
             last_speech_time = time.time()
             processor.insert_audio_chunk(samples)
-            if speaker_tracker and speaker_tracker.available:
-                speaker_tracker.feed_audio(samples)
+
 
     async def transcribe_and_translate():
         nonlocal confirmed_source, confirmed_display, speculative_source
         nonlocal windows_processed, processing_time_total
         nonlocal silence_reset_done, consecutive_timeouts, consecutive_hallucinations
-        nonlocal prev_speaker
+
 
         # Wait for initial audio
         while not shutdown.is_set():
@@ -451,18 +429,6 @@ async def run_pipeline(
                     consecutive_hallucinations = 0
 
                 if confirmed:
-                    # Speaker change detection — inject coloured tag
-                    if speaker_tracker and speaker_tracker.available:
-                        await loop.run_in_executor(None, speaker_tracker.process)
-                        cur = speaker_tracker.current_speaker()
-                        if cur and cur != prev_speaker:
-                            if cur not in speaker_colour_map:
-                                idx = len(speaker_colour_map) % len(SPEAKER_COLOURS)
-                                speaker_colour_map[cur] = SPEAKER_COLOURS[idx]
-                            colour = speaker_colour_map[cur]
-                            tag = f"\n{colour}[{cur}]\033[0m "
-                            confirmed_source += tag
-                            prev_speaker = cur
                     confirmed_source += (" " + confirmed if confirmed_source else confirmed)
 
                 # ── translation ──
@@ -492,11 +458,6 @@ async def run_pipeline(
                 else:
                     locked = translator.confirmed_translation
                     spec = translator.speculative_translation
-
-            # ── diarization (keep warm even without confirmed text) ──
-            # Run in executor to avoid blocking the event loop
-            if speaker_tracker and speaker_tracker.available and not confirmed:
-                await loop.run_in_executor(None, speaker_tracker.process)
 
             # ── display ──
             avg_ms = (

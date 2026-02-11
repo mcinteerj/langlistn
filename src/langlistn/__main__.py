@@ -4,8 +4,7 @@ import os
 
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["TQDM_DISABLE"] = "1"
-# Suppress C-level OMP deprecation messages from torch/diart
-os.environ["KMP_WARNINGS"] = "off"
+
 
 try:
     import multiprocessing.resource_tracker as _rt
@@ -374,8 +373,7 @@ examples:
     parser.add_argument("--translate-model", metavar="TIER", default="haiku",
                         choices=["haiku", "sonnet", "opus"], help="Claude model tier")
     parser.add_argument("--no-translate", action="store_true", help="Transcribe only")
-    parser.add_argument("--diarize", action="store_true",
-                        help="[experimental] Speaker diarization — heavy CPU, may slow transcription")
+
     parser.add_argument("--json", dest="output_json", action="store_true", help="JSON output for --list-*")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
 
@@ -479,7 +477,7 @@ examples:
         max_context_chars=args.max_context,
         silence_reset_seconds=args.silence_reset,
         force_confirm_after=args.force_confirm,
-        diarize=args.diarize,
+
     )
 
     try:

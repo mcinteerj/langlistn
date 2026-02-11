@@ -21,14 +21,6 @@ RESET = "\033[0m"
 CLEAR_LINE = "\033[2K"
 MOVE_UP = "\033[A"
 
-SPEAKER_COLOURS = [
-    "\033[36m",  # cyan
-    "\033[33m",  # yellow
-    "\033[32m",  # green
-    "\033[35m",  # magenta
-    "\033[34m",  # blue
-    "\033[91m",  # bright red
-]
 
 _ANSI_RE = re.compile(r'\033\[[0-9;]*m')
 

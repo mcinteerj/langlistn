@@ -30,12 +30,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-diarize = [
-    "diart>=0.9",
-    "torchaudio>=2.0,<2.6",
-    "torchvision>=0.16,<0.21",
-    "huggingface-hub<0.24",
-]
+
 
 [tool.setuptools.packages.find]
 where = ["src"]
