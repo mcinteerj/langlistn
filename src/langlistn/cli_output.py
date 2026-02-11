@@ -11,8 +11,8 @@ from .audio.mic_capture import MicCapture
 from .config import resolve_language_name
 from .whisper_local import (
     LocalWhisperSession, _is_hallucination,
-    STEP_SECONDS, WINDOW_SECONDS, _seconds_to_bytes,
-    SAMPLE_RATE, BYTES_PER_SAMPLE,
+    STEP_SECONDS, WINDOW_SECONDS,
+    SAMPLE_RATE, BYTES_PER_SAMPLE, _seconds_to_bytes,
 )
 
 # ANSI — only bold/dim/reset to respect terminal theme
@@ -43,31 +43,53 @@ def _wrap_text(text: str, width: int) -> list[str]:
 class TerminalDisplay:
     """Live terminal output — confirmed text scrolls up, speculative gets overwritten."""
 
-    def __init__(self):
+    def __init__(self, plain: bool = False):
         self.width = shutil.get_terminal_size().columns
+        self.plain = plain
         self._spec_lines_on_screen = 0
 
     def _erase_speculative(self):
+        if self.plain:
+            return
         for _ in range(self._spec_lines_on_screen):
             sys.stdout.write(f"{MOVE_UP}{CLEAR_LINE}\r")
         self._spec_lines_on_screen = 0
 
-    def print_confirmed(self, text: str):
+    def print_confirmed(self, text: str, original: str | None = None):
+        """Print confirmed translation. If original provided, show above."""
         if not text.strip():
             return
         self._erase_speculative()
-        lines = _wrap_text(text, self.width - 14)
-        for line in lines:
-            sys.stdout.write(f"  [CONFIRMED] {line}\n")
+        if self.plain:
+            if original:
+                sys.stdout.write(f"{original}\n")
+            sys.stdout.write(f"{text}\n")
+        else:
+            if original:
+                lines = _wrap_text(original, self.width - 1)
+                for line in lines:
+                    sys.stdout.write(f"{DIM}{line}{RESET}\n")
+            lines = _wrap_text(text, self.width - 1)
+            for line in lines:
+                sys.stdout.write(f"{BOLD}{line}{RESET}\n")
         sys.stdout.flush()
 
-    def print_speculative(self, text: str, status: str):
+    def print_speculative(self, text: str, status: str, original: str | None = None):
+        """Print speculative text + status (will be overwritten next call)."""
+        if self.plain:
+            # Plain mode: don't print speculative (only confirmed)
+            return
         self._erase_speculative()
         count = 0
-        if text.strip():
-            lines = _wrap_text(text, self.width - 14)
+        if original and original.strip():
+            lines = _wrap_text(original, self.width - 1)
             for line in lines:
-                sys.stdout.write(f"  [SPEC]      {DIM}{line}{RESET}\n")
+                sys.stdout.write(f"{DIM}{line}{RESET}\n")
+            count += len(lines)
+        if text.strip():
+            lines = _wrap_text(text, self.width - 1)
+            for line in lines:
+                sys.stdout.write(f"{DIM}{line}{RESET}\n")
             count += len(lines)
         status_trunc = status[:self.width - 1]
         sys.stdout.write(f"{DIM}{status_trunc}{RESET}\n")
@@ -75,10 +97,13 @@ class TerminalDisplay:
         self._spec_lines_on_screen = count
         sys.stdout.flush()
 
-    def print_header(self, mode: str, lang: str | None):
+    def print_header(self, mode: str, lang: str | None, model: str):
+        if self.plain:
+            return
         lang_display = f"{lang} → English" if lang else "auto-detect → English"
         sep = "─" * self.width
-        sys.stdout.write(f"\n{BOLD}langlistn{RESET} — {lang_display} — {mode}\n")
+        model_short = model.split("/")[-1] if "/" in model else model
+        sys.stdout.write(f"\n{BOLD}langlistn{RESET} — {lang_display} — {mode} — {model_short}\n")
         sys.stdout.write(f"{DIM}{sep}{RESET}\n\n")
         sys.stdout.flush()
 
@@ -88,8 +113,10 @@ async def run_cli(
     mic: bool = False,
     device: str | None = None,
     lang: str | None = None,
-    model: str = "mlx-community/whisper-large-v3-mlx",
+    model: str | None = None,
     log_path: str | None = None,
+    plain: bool = False,
+    dual_lang: bool = False,
 ) -> None:
     """Run langlistn with plain terminal output."""
 
@@ -105,26 +132,30 @@ async def run_cli(
     else:
         raise ValueError("Must specify --app or --mic")
 
-    display = TerminalDisplay()
-    display.print_header(mode, lang_name or lang)
+    session = LocalWhisperSession(
+        lang=lang,
+        model=model,  # None = auto-select based on RAM
+        dual_lang=dual_lang,
+    )
+
+    display = TerminalDisplay(plain=plain)
+    display.print_header(mode, lang_name or lang, session.model_name)
 
     log_file = None
     if log_path:
         try:
             log_file = open(log_path, "a", encoding="utf-8")
         except OSError as e:
-            print(f"Warning: could not open log file: {e}")
+            sys.stderr.write(f"Warning: could not open log file: {e}\n")
 
     display.print_speculative("", "starting audio capture...")
     try:
         await source.start()
     except Exception as e:
-        print(f"\nAudio capture failed: {e}")
+        sys.stderr.write(f"\nAudio capture failed: {e}\n")
         return
 
-    display.print_speculative("", "loading model...")
-
-    session = LocalWhisperSession(lang=lang, model=model)
+    display.print_speculative("", f"loading {session.model_name}...")
     await session.connect()
 
     shutdown = asyncio.Event()
@@ -132,24 +163,16 @@ async def run_cli(
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, shutdown.set)
 
-    # --- Timestamp-based confirmed/speculative tracking ---
-    #
-    # With 20s window and 5s step, each window slides 5s forward.
-    # Whisper gives relative timestamps (0-20s within each window).
-    #
-    # In relative time, the overlap region is [0, 15s] — audio that
-    # also existed in the previous window. The new audio is [15s, 20s].
-    #
-    # But [0, 10s] was already confirmed by previous windows. So:
-    #   [0, overlap-step]       = already confirmed → SKIP
-    #   [overlap-step, overlap] = was speculative, now confirmed → CONFIRM  
-    #   [overlap, 20s]          = brand new → SPECULATIVE
-    #
-    # In our config: skip < 10s, confirm 10-15s, speculate 15-20s.
+    # --- Timestamp-based confirmed/speculative ---
+    # With 20s window / 5s step:
+    #   [0, 10s]  = already confirmed → skip
+    #   [10s, 15s] = newly confirmed → emit
+    #   [15s, 20s] = speculative → overwrite next cycle
 
     overlap_seconds = WINDOW_SECONDS - STEP_SECONDS  # 15s
-    confirm_start = overlap_seconds - STEP_SECONDS     # 10s — newly confirmed zone starts here
+    confirm_start = overlap_seconds - STEP_SECONDS    # 10s
     windows_processed = 0
+    last_speculative_text = ""  # For flushing on shutdown
 
     async def audio_loop():
         while not shutdown.is_set():
@@ -159,41 +182,61 @@ async def run_cli(
             await session.send_audio(chunk)
 
     async def process_loop():
-        nonlocal windows_processed
-
-        step_bytes = _seconds_to_bytes(STEP_SECONDS)
-        window_bytes = _seconds_to_bytes(WINDOW_SECONDS)
+        nonlocal windows_processed, last_speculative_text
         start_time = time.time()
+        min_buffer_bytes = _seconds_to_bytes(STEP_SECONDS)
 
+        # Wait for initial buffer
         while not shutdown.is_set():
             await asyncio.sleep(0.5)
-            if len(session._audio_buffer) >= step_bytes:
+            pcm, dur = session._get_window_pcm()
+            if len(pcm) >= min_buffer_bytes:
                 break
 
         display.print_speculative("", "listening...")
 
         while not shutdown.is_set():
-            async with session._buffer_lock:
-                buf_len = len(session._audio_buffer)
-                if buf_len < step_bytes:
-                    await asyncio.sleep(0.5)
-                    continue
-                take = min(buf_len, window_bytes)
-                window_pcm = bytes(session._audio_buffer[-take:])
+            # Wait for either step interval or early speech→silence trigger
+            try:
+                await asyncio.wait_for(
+                    session._early_trigger.wait(),
+                    timeout=STEP_SECONDS,
+                )
+                session._early_trigger.clear()
+            except asyncio.TimeoutError:
+                pass
 
+            if shutdown.is_set():
+                break
+
+            # Grab window
+            pcm, duration = session._get_window_pcm()
+            if len(pcm) < min_buffer_bytes:
+                continue
+
+            # Run Whisper
             t0 = time.time()
             try:
-                result = await loop.run_in_executor(
-                    None, session._transcribe, window_pcm
-                )
+                if session.dual_lang:
+                    translated, transcribed = await loop.run_in_executor(
+                        None, session._transcribe_dual, pcm
+                    )
+                    result = translated
+                    original_text = transcribed.get("text", "").strip()
+                    original_segments = transcribed.get("segments", [])
+                else:
+                    result = await loop.run_in_executor(
+                        None, session._transcribe, pcm, None
+                    )
+                    original_text = None
+                    original_segments = None
             except Exception as e:
                 display.print_speculative("", f"error: {e}")
-                await asyncio.sleep(STEP_SECONDS)
                 continue
             elapsed = time.time() - t0
 
             session.stats.windows_processed += 1
-            session.stats.audio_seconds_processed += len(window_pcm) / (SAMPLE_RATE * BYTES_PER_SAMPLE)
+            session.stats.audio_seconds_processed += duration
             session.stats.processing_time_total += elapsed
             windows_processed += 1
 
@@ -202,60 +245,71 @@ async def run_cli(
 
             if not text or _is_hallucination(text):
                 runtime = int(time.time() - start_time)
-                display.print_speculative("", f"{session.stats.status_line()} · {runtime // 60}:{runtime % 60:02d}")
-                await asyncio.sleep(STEP_SECONDS)
+                display.print_speculative(
+                    "", f"{session.stats.status_line()} · {runtime // 60}:{runtime % 60:02d}"
+                )
                 continue
 
-            # --- Split segments into confirmed vs speculative by timestamp ---
-            #
-            # Window timeline (relative timestamps from Whisper):
-            #   [0 ......... prev_boundary ... overlap_seconds ... WINDOW_SECONDS]
-            #    ^-- already confirmed --^ ^-- newly confirmed --^ ^-- speculative
-            #
-            # First window: everything speculative (no prior window to confirm against).
-            # After that: segments between prev_boundary and overlap_seconds are the
-            # "new slice" that was speculative last window and is now confirmed.
-
+            # Split by timestamp
             confirmed_parts: list[str] = []
             speculative_parts: list[str] = []
+            confirmed_orig_parts: list[str] = []
+            speculative_orig_parts: list[str] = []
 
             if windows_processed <= 1:
-                # First window — all speculative
-                speculative_parts = [s.get("text", "").strip() for s in segments if s.get("text", "").strip()]
+                speculative_parts = [
+                    s.get("text", "").strip() for s in segments
+                    if s.get("text", "").strip()
+                ]
+                if original_segments:
+                    speculative_orig_parts = [
+                        s.get("text", "").strip() for s in original_segments
+                        if s.get("text", "").strip()
+                    ]
             else:
                 for seg in segments:
                     seg_text = seg.get("text", "").strip()
                     if not seg_text:
                         continue
                     seg_end = seg.get("end", 0)
-
                     if seg_end <= confirm_start:
-                        # [0, 10s] — already confirmed previously → skip
                         continue
                     elif seg_end <= overlap_seconds:
-                        # [10s, 15s] — was speculative, now confirmed
                         confirmed_parts.append(seg_text)
                     else:
-                        # [15s, 20s] — new audio → speculative
                         speculative_parts.append(seg_text)
+
+                if original_segments:
+                    for seg in original_segments:
+                        seg_text = seg.get("text", "").strip()
+                        if not seg_text:
+                            continue
+                        seg_end = seg.get("end", 0)
+                        if seg_end <= confirm_start:
+                            continue
+                        elif seg_end <= overlap_seconds:
+                            confirmed_orig_parts.append(seg_text)
+                        else:
+                            speculative_orig_parts.append(seg_text)
 
             confirmed_text = " ".join(confirmed_parts)
             speculative_text = " ".join(speculative_parts)
+            confirmed_orig = " ".join(confirmed_orig_parts) if confirmed_orig_parts else None
+            speculative_orig = " ".join(speculative_orig_parts) if speculative_orig_parts else None
 
-            # Emit confirmed
+            last_speculative_text = speculative_text
+
             if confirmed_text:
-                display.print_confirmed(confirmed_text)
+                display.print_confirmed(confirmed_text, original=confirmed_orig)
                 if log_file:
-                    log_file.write(confirmed_text + "\n")
+                    if confirmed_orig:
+                        log_file.write(f"[original] {confirmed_orig}\n")
+                    log_file.write(f"{confirmed_text}\n")
                     log_file.flush()
 
-            # Show speculative + status
             runtime = int(time.time() - start_time)
             status = f"{session.stats.status_line()} · {runtime // 60}:{runtime % 60:02d}"
-            display.print_speculative(speculative_text, status)
-
-            sleep_time = max(0.1, STEP_SECONDS - elapsed)
-            await asyncio.sleep(sleep_time)
+            display.print_speculative(speculative_text, status, original=speculative_orig)
 
     try:
         tasks = [
@@ -270,12 +324,17 @@ async def run_cli(
     except asyncio.CancelledError:
         pass
     finally:
+        # Flush last speculative as confirmed (otherwise we lose the tail)
+        if last_speculative_text:
+            display.print_confirmed(last_speculative_text)
+            if log_file:
+                log_file.write(f"{last_speculative_text}\n")
+
         display._erase_speculative()
-        sys.stdout.write(f"{DIM}shutting down...{RESET}\n")
-        sys.stdout.flush()
+        if not plain:
+            sys.stdout.write(f"{DIM}done.{RESET}\n\n")
+            sys.stdout.flush()
         await session.shutdown()
         await source.stop()
         if log_file:
             log_file.close()
-        sys.stdout.write(f"{DIM}done.{RESET}\n\n")
-        sys.stdout.flush()
