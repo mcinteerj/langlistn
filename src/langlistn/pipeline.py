@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 from .audio import AudioSource
 from .config import SILENCE_RMS_THRESHOLD
-from .display import TerminalDisplay
+from .display import TerminalDisplay, SPEAKER_COLOURS
 from .streaming_asr import MLXWhisperASR, OnlineASRProcessor, SAMPLING_RATE
 from .diarize import SpeakerTracker
 from .translate import ContinuationTranslator
@@ -240,6 +240,17 @@ async def run_pipeline(
     consecutive_timeouts = 0
     consecutive_hallucinations = 0  # track whisper hallucination streaks
     recent_whisper_hypotheses: list[str] = []  # last N raw whisper speculative outputs
+    prev_speaker: str | None = None
+    speaker_colour_map: dict[str, str] = {}  # speaker name → ANSI colour
+
+    def _build_status() -> str:
+        runtime = int(time.time() - start_time)
+        runtime_str = f"{runtime // 60}:{runtime % 60:02d}"
+        cost_display = f"${translator.estimated_cost():.2f}" if translator else ""
+        silence_dur = time.time() - last_speech_time
+        if silence_dur > 2.0:
+            return f"⏸  waiting for speech... · {runtime_str} · {cost_display}".rstrip(" ·")
+        return f"🎧 {runtime_str} · {cost_display}".rstrip(" ·")
 
     async def audio_loop():
         nonlocal last_speech_time
@@ -291,21 +302,21 @@ async def run_pipeline(
                             .strip()
                         )
                         translator.speculative_translation = ""
-                        # Sync display: lock everything currently shown
                         full = translator.confirmed_translation
                         display.update(full, "", "silence — context locked")
-                    # Now reset for next speech segment — but keep confirmed
-                    # translation visible (display._last_locked_text persists).
-                    # Only reset the diff tracking so next speech starts fresh.
                     translator._last_full_output = ""
                     confirmed_source = ""
                     silence_reset_done = True
                 if buf_seconds < cfg.min_audio_seconds:
+                    locked_text = translator.confirmed_translation if translator else confirmed_source
+                    display.update(locked_text, "", _build_status())
                     continue
             else:
                 silence_reset_done = False
 
             if buf_seconds < cfg.min_audio_seconds:
+                locked_text = translator.confirmed_translation if translator else confirmed_source
+                display.update(locked_text, "", _build_status())
                 continue
 
             # Skip if whisper already running
@@ -395,6 +406,18 @@ async def run_pipeline(
                     consecutive_hallucinations = 0
 
                 if confirmed:
+                    # Speaker change detection — inject coloured tag
+                    if speaker_tracker and speaker_tracker.available:
+                        speaker_tracker.process()
+                        cur = speaker_tracker.current_speaker()
+                        if cur and cur != prev_speaker:
+                            if cur not in speaker_colour_map:
+                                idx = len(speaker_colour_map) % len(SPEAKER_COLOURS)
+                                speaker_colour_map[cur] = SPEAKER_COLOURS[idx]
+                            colour = speaker_colour_map[cur]
+                            tag = f"\n{colour}[{cur}]\033[0m "
+                            confirmed_source += tag
+                            prev_speaker = cur
                     confirmed_source += (" " + confirmed if confirmed_source else confirmed)
 
                 # ── translation ──
@@ -428,27 +451,21 @@ async def run_pipeline(
                     locked = translator.confirmed_translation
                     spec = translator.speculative_translation
 
-            # ── diarization ──
-            speaker_label = ""
-            if speaker_tracker and speaker_tracker.available:
+            # ── diarization (keep warm even without confirmed text) ──
+            if speaker_tracker and speaker_tracker.available and not confirmed:
                 speaker_tracker.process()
-                cur = speaker_tracker.current_speaker()
-                if cur:
-                    speaker_label = f"[{cur}] "
 
             # ── display ──
-            runtime = int(time.time() - start_time)
             avg_ms = (
                 (processing_time_total / windows_processed * 1000)
                 if windows_processed
                 else 0
             )
-            cost_str = f"${translator.estimated_cost():.3f}" if translator else "$0.00"
-            status = (
-                f"{speaker_label}listening · windows: {windows_processed} · "
-                f"avg: {avg_ms:.0f}ms · buf: {buf_seconds:.0f}s · "
-                f"{runtime // 60}:{runtime % 60:02d} · {cost_str}"
+            logger.debug(
+                "stats | windows=%d avg=%.0fms buf=%.0fs",
+                windows_processed, avg_ms, buf_seconds,
             )
+            status = _build_status()
             display.update(locked, spec, status)
 
             if log_file and confirmed:
