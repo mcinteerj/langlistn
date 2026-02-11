@@ -1,7 +1,6 @@
 import AppKit
 import Foundation
 import ScreenCaptureKit
-import AVFoundation
 import Accelerate
 
 // MARK: - CLI Argument Parsing

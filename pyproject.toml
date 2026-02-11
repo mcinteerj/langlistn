@@ -29,9 +29,6 @@ dependencies = [
     "silero-vad>=5.1",
 ]
 
-[project.optional-dependencies]
-
-
 [tool.setuptools.packages.find]
 where = ["src"]
 

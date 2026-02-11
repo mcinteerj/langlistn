@@ -19,11 +19,10 @@ import logging
 import math
 import signal
 import sys
-import termios
 import threading
 import time
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -65,9 +64,9 @@ class PipelineConfig:
     """Tunables for the two-loop pipeline."""
 
     # Transcription
-    process_interval: float = 0.3
+    process_interval: float = 0.5
     min_audio_seconds: float = 1.0
-    buffer_trimming_sec: float = 25
+    buffer_trimming_sec: float = 18
     whisper_timeout: float = 8.0        # Kill whisper if it takes longer than this
 
     # Translation
@@ -77,13 +76,6 @@ class PipelineConfig:
 
     # Silence / reset
     silence_reset_seconds: float = 10.0
-
-    # Display
-    dual_lang: bool = False
-
-    # Diarization
-
-
 
 def _rms_int16(chunk: bytes) -> float:
     samples = array.array("h")
@@ -264,31 +256,41 @@ async def run_pipeline(
         loop.add_signal_handler(sig, shutdown.set)
 
     # ── shared state ──
-    confirmed_source = ""
-    confirmed_display = ""  # accumulated display text (survives silence resets)
-    speculative_source = ""
-    last_speech_time = time.time()
+    @dataclass
+    class SharedState:
+        confirmed_source: str = ""
+        speculative_source: str = ""
+        confirmed_translation: str = ""
+        speculative_translation: str = ""
+        confirmed_display: str = ""  # survives silence resets
+        source_version: int = 0
+        last_translated_version: int = 0
+        last_speech_time: float = 0.0
+        silence_reset_done: bool = False
+        streaming_active: bool = False
+        lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    state = SharedState(last_speech_time=time.time())
+    source_changed = asyncio.Event()
     whisper_lock = asyncio.Lock()
     windows_processed = 0
     processing_time_total = 0.0
     start_time = time.time()
-    silence_reset_done = False  # prevents repeated resets
     consecutive_timeouts = 0
-    consecutive_hallucinations = 0  # track whisper hallucination streaks
-    recent_whisper_hypotheses: list[str] = []  # last N raw whisper speculative outputs
+    consecutive_hallucinations = 0
+    recent_whisper_hypotheses: list[str] = []
 
 
     def _build_status() -> str:
         runtime = int(time.time() - start_time)
         runtime_str = f"{runtime // 60}:{runtime % 60:02d}"
         cost_display = f"${translator.estimated_cost():.2f}" if translator else ""
-        silence_dur = time.time() - last_speech_time
+        silence_dur = time.time() - state.last_speech_time
         if silence_dur > 2.0:
             return f"⏸  waiting for speech... · {runtime_str} · {cost_display}".rstrip(" ·")
         return f"🎧 {runtime_str} · {cost_display}".rstrip(" ·")
 
     async def audio_loop():
-        nonlocal last_speech_time
         while not shutdown.is_set():
             chunk = await source.read_chunk()
             if chunk is None:
@@ -297,19 +299,16 @@ async def run_pipeline(
             if rms < SILENCE_RMS_THRESHOLD:
                 continue
             samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
-            # Silero VAD gate — only feed speech to whisper
             if vad_model is not None:
                 if not _chunk_has_speech(vad_model, samples):
                     continue
-            last_speech_time = time.time()
+            state.last_speech_time = time.time()
             processor.insert_audio_chunk(samples)
 
 
-    async def transcribe_and_translate():
-        nonlocal confirmed_source, confirmed_display, speculative_source
+    async def whisper_loop():
         nonlocal windows_processed, processing_time_total
-        nonlocal silence_reset_done, consecutive_timeouts, consecutive_hallucinations
-
+        nonlocal consecutive_timeouts, consecutive_hallucinations
 
         # Wait for initial audio
         while not shutdown.is_set():
@@ -327,39 +326,39 @@ async def run_pipeline(
             buf_seconds = len(processor.audio_buffer) / SAMPLING_RATE
 
             # ── silence detection ──
-            silence_duration = time.time() - last_speech_time
+            silence_duration = time.time() - state.last_speech_time
             if silence_duration > cfg.silence_reset_seconds:
-                if not silence_reset_done:
-                    if translator:
-                        # Promote any remaining speculative to confirmed before reset
-                        if translator.speculative_translation:
-                            translator.confirmed_translation = (
-                                (translator.confirmed_translation + " " + translator.speculative_translation)
-                                .strip()
-                            )
-                            translator.speculative_translation = ""
-                            full = translator.confirmed_translation
-                            display.update(full, "", "silence — context locked")
-                        translator._last_full_output = ""
-                    else:
-                        # No-translate: promote source text to display baseline
-                        confirmed_display += (" " + confirmed_source if confirmed_display else confirmed_source)
-                        confirmed_display = confirmed_display.strip()
-                    confirmed_source = ""
-                    silence_reset_done = True
+                if not state.silence_reset_done:
+                    async with state.lock:
+                        if translator:
+                            if translator.speculative_translation:
+                                translator.confirmed_translation = (
+                                    (translator.confirmed_translation + " " + translator.speculative_translation)
+                                    .strip()
+                                )
+                                translator.speculative_translation = ""
+                                display.update(translator.confirmed_translation, "", "silence — context locked")
+                            translator._last_full_output = ""
+                        else:
+                            state.confirmed_display += (" " + state.confirmed_source if state.confirmed_display else state.confirmed_source)
+                            state.confirmed_display = state.confirmed_display.strip()
+                        state.confirmed_source = ""
+                        state.silence_reset_done = True
                 if buf_seconds < cfg.min_audio_seconds:
-                    locked_text = translator.confirmed_translation if translator else confirmed_display
-                    display.update(locked_text, "", _build_status())
+                    if not state.streaming_active:
+                        locked_text = translator.confirmed_translation if translator else state.confirmed_display
+                        display.update(locked_text, "", _build_status())
                     continue
             else:
-                silence_reset_done = False
+                state.silence_reset_done = False
 
             if buf_seconds < cfg.min_audio_seconds:
-                if translator:
-                    locked_text = translator.confirmed_translation
-                else:
-                    locked_text = (confirmed_display + " " + confirmed_source).strip() if confirmed_source else confirmed_display
-                display.update(locked_text, "", _build_status())
+                if not state.streaming_active:
+                    if translator:
+                        locked_text = translator.confirmed_translation
+                    else:
+                        locked_text = (state.confirmed_display + " " + state.confirmed_source).strip() if state.confirmed_source else state.confirmed_display
+                    display.update(locked_text, "", _build_status())
                 continue
 
             # Skip if whisper already running
@@ -385,9 +384,6 @@ async def run_pipeline(
                     except Exception:
                         pass
                     logger.warning("WHISPER slow run finished after %.1fs total — discarding", time.time() - t0)
-
-                    # After 2 consecutive timeouts, reset processor to break
-                    # the hallucination→bad prompt→slow whisper death spiral
                     if consecutive_timeouts >= 2:
                         logger.warning("WHISPER resetting processor after %d consecutive timeouts", consecutive_timeouts)
                         offset = processor.buffer_time_offset + len(processor.audio_buffer) / SAMPLING_RATE
@@ -422,19 +418,19 @@ async def run_pipeline(
                             confirmed = ""
                             is_halluc = True
 
-                speculative_source = processor.get_speculative()
-                if speculative_source and _is_hallucination(speculative_source):
-                    speculative_source = ""
+                speculative = processor.get_speculative()
+                if speculative and _is_hallucination(speculative):
+                    speculative = ""
                     is_halluc = True
 
-                # Stash raw whisper hypothesis for multi-hypothesis LLM feeding
+                # Stash raw whisper hypothesis
                 raw_hyp = processor.get_speculative()
                 if raw_hyp and not _is_hallucination(raw_hyp):
                     recent_whisper_hypotheses.append(raw_hyp)
                     if len(recent_whisper_hypotheses) > 3:
                         recent_whisper_hypotheses.pop(0)
 
-                # Track consecutive hallucinations — reset processor if stuck
+                # Track consecutive hallucinations
                 if is_halluc and not confirmed:
                     consecutive_hallucinations += 1
                     if consecutive_hallucinations >= 3:
@@ -448,58 +444,98 @@ async def run_pipeline(
                 else:
                     consecutive_hallucinations = 0
 
-                if confirmed:
-                    confirmed_source += (" " + confirmed if confirmed_source else confirmed)
+                # Update shared state
+                async with state.lock:
+                    if confirmed:
+                        state.confirmed_source += (" " + confirmed if state.confirmed_source else confirmed)
+                    state.speculative_source = speculative
+                    state.source_version += 1
+                    source_changed.set()
 
-                # ── translation ──
-                # Only translate if we have something meaningful
-                full_source = confirmed_source
-                if speculative_source:
-                    full_source += " " + speculative_source
-
-                if not translator or not full_source.strip():
-                    locked = (confirmed_display + " " + confirmed_source).strip() if confirmed_source else confirmed_display
-                    spec = speculative_source
-                elif confirmed or (cfg.translate_on_every_cycle and speculative_source):
-                    # Only call LLM when there's new confirmed or new speculative
-                    # Feed alternative whisper hypotheses for disambiguation
-                    alt_hypotheses = [
-                        h for h in recent_whisper_hypotheses[:-1]
-                        if h != speculative_source
-                    ][-2:]  # max 2 alternatives
-
-                    try:
-                        locked, spec = await loop.run_in_executor(
-                            None, translator.translate, full_source, alt_hypotheses
-                        )
-                    except Exception:
+                # Display source immediately (unless translation is streaming)
+                if not state.streaming_active:
+                    if translator:
                         locked = translator.confirmed_translation
                         spec = translator.speculative_translation
-                else:
-                    locked = translator.confirmed_translation
-                    spec = translator.speculative_translation
+                    else:
+                        locked = (state.confirmed_display + " " + state.confirmed_source).strip() if state.confirmed_source else state.confirmed_display
+                        spec = speculative
+                    display.update(locked, spec, _build_status())
 
-            # ── display ──
-            avg_ms = (
-                (processing_time_total / windows_processed * 1000)
-                if windows_processed
-                else 0
-            )
-            logger.debug(
-                "stats | windows=%d avg=%.0fms buf=%.0fs",
-                windows_processed, avg_ms, buf_seconds,
-            )
-            status = _build_status()
-            display.update(locked, spec, status)
+                if log_file and confirmed:
+                    log_file.write(f"{confirmed}\n")
+                    log_file.flush()
 
-            if log_file and confirmed:
-                log_file.write(f"{confirmed}\n")
-                log_file.flush()
+
+    async def translate_loop():
+        """Independent translation loop — reacts to source_version changes."""
+        if not translator:
+            return  # no-translate mode: this loop is a no-op
+
+        while not shutdown.is_set():
+            # Wait for source changes (with timeout for periodic retranslation)
+            try:
+                await asyncio.wait_for(source_changed.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                pass
+            source_changed.clear()
+
+            if shutdown.is_set():
+                break
+
+            # Skip if nothing new to translate
+            async with state.lock:
+                if state.source_version == state.last_translated_version:
+                    continue
+                if state.silence_reset_done:
+                    continue
+                full_source = state.confirmed_source
+                if state.speculative_source:
+                    full_source += " " + state.speculative_source
+                current_version = state.source_version
+
+            if not full_source.strip():
+                continue
+
+            alt_hypotheses = [
+                h for h in recent_whisper_hypotheses[:-1]
+                if h != state.speculative_source
+            ][-2:]
+
+            # Streaming callback for live display updates
+            def on_token(partial_translation: str):
+                confirmed_t = translator.confirmed_translation
+                # The LLM outputs the FULL translation from scratch each time.
+                # While it's still reproducing the already-confirmed prefix,
+                # don't show anything speculative (it would duplicate).
+                # Only show the new tail once it extends past confirmed text.
+                if len(partial_translation) <= len(confirmed_t):
+                    return  # still reproducing confirmed prefix — no update
+                spec_part = partial_translation[len(confirmed_t):].strip()
+                if spec_part:
+                    display.update(confirmed_t, spec_part, _build_status())
+
+            state.streaming_active = True
+            try:
+                locked, spec = await loop.run_in_executor(
+                    None, translator.translate_streaming, full_source, alt_hypotheses, on_token
+                )
+            except Exception:
+                locked = translator.confirmed_translation
+                spec = translator.speculative_translation
+            finally:
+                state.streaming_active = False
+
+            async with state.lock:
+                state.last_translated_version = current_version
+
+            display.update(locked, spec, _build_status())
 
     try:
         tasks = [
             asyncio.create_task(audio_loop()),
-            asyncio.create_task(transcribe_and_translate()),
+            asyncio.create_task(whisper_loop()),
+            asyncio.create_task(translate_loop()),
             asyncio.create_task(shutdown.wait()),
         ]
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -520,10 +556,10 @@ async def run_pipeline(
         # Flush remaining speculative
         _, _, remaining = processor.finish()
         if remaining and not _is_hallucination(remaining):
-            confirmed_source += (" " + remaining if confirmed_source else remaining)
+            state.confirmed_source += (" " + remaining if state.confirmed_source else remaining)
 
         full_final = ""
-        all_source = (confirmed_display + " " + confirmed_source).strip()
+        all_source = (state.confirmed_display + " " + state.confirmed_source).strip()
         if translator and all_source:
             # Use existing translation if available, skip final LLM call
             existing = (translator.confirmed_translation + " " + translator.speculative_translation).strip()

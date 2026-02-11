@@ -21,31 +21,14 @@ from botocore.exceptions import (
     UnauthorizedSSOTokenError,
 )
 
+from .config import LANGUAGE_MAP
+
 logger = logging.getLogger(__name__)
 
 MODELS = {
     "haiku": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
     "sonnet": "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
     "opus": "global.anthropic.claude-opus-4-6-v1",
-}
-
-LANGUAGE_NAMES = {
-    "ko": "Korean",
-    "ja": "Japanese",
-    "zh": "Chinese",
-    "th": "Thai",
-    "vi": "Vietnamese",
-    "id": "Indonesian",
-    "ms": "Malay",
-    "tl": "Tagalog",
-    "fr": "French",
-    "de": "German",
-    "es": "Spanish",
-    "pt": "Portuguese",
-    "ru": "Russian",
-    "ar": "Arabic",
-    "hi": "Hindi",
-    "it": "Italian",
 }
 
 PRICING = {
@@ -144,6 +127,90 @@ class ContinuationTranslator:
         )
         logger.error("AWS auth failed: %s", msg)
 
+    def translate_streaming(
+        self,
+        source_text: str,
+        alt_hypotheses: list[str] | None = None,
+        on_token: "Callable[[str], None] | None" = None,
+    ) -> tuple[str, str]:
+        """Streaming translation. on_token receives accumulated text so far.
+
+        Falls back to non-streaming translate() on error.
+        """
+        if not source_text.strip():
+            return self.confirmed_translation, self.speculative_translation
+
+        lang_name = LANGUAGE_MAP.get(
+            self.source_lang, self.source_lang or "the source language"
+        )
+        source_trimmed = source_text[-self.max_context_chars:]
+        confirmed_ctx = self.confirmed_translation[-self.max_context_chars:]
+        prompt = self._build_prompt(lang_name, source_trimmed, confirmed_ctx, alt_hypotheses)
+
+        if self._auth_failed:
+            return self.confirmed_translation, self.speculative_translation
+
+        try:
+            client = self._get_client()
+        except (NoCredentialsError, TokenRetrievalError, UnauthorizedSSOTokenError):
+            return self.confirmed_translation, self.speculative_translation
+
+        body = {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+
+        try:
+            response = client.invoke_model_with_response_stream(
+                modelId=self.model_id,
+                body=json.dumps(body),
+                contentType="application/json",
+            )
+            stream = response.get("body")
+            full_text = ""
+            for event in stream:
+                chunk = event.get("chunk")
+                if chunk:
+                    data = json.loads(chunk["bytes"])
+                    if data.get("type") == "content_block_delta":
+                        token = data.get("delta", {}).get("text", "")
+                        full_text += token
+                        if on_token:
+                            on_token(full_text)
+                    elif data.get("type") == "message_delta":
+                        usage = data.get("usage", {})
+                        self.output_tokens += usage.get("output_tokens", 0)
+                    elif data.get("type") == "message_start":
+                        usage = data.get("message", {}).get("usage", {})
+                        self.input_tokens += usage.get("input_tokens", 0)
+
+            full_translation = full_text.strip()
+            self.calls += 1
+
+            logger.debug(
+                "LLM stream #%d | SOURCE: %s | LLM_OUT: %s",
+                self.calls, source_text[:200], full_translation[:200],
+            )
+
+            self._update_confirmation(full_translation)
+            return self.confirmed_translation, self.speculative_translation
+
+        except (NoCredentialsError, TokenRetrievalError, UnauthorizedSSOTokenError) as e:
+            self._handle_auth_error(e)
+            return self.confirmed_translation, self.speculative_translation
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if code in ("ExpiredTokenException", "UnrecognizedClientException", "AccessDeniedException"):
+                self._handle_auth_error(e)
+            else:
+                logger.error("Streaming translation failed: %s — falling back", e)
+                return self.translate(source_text, alt_hypotheses)
+            return self.confirmed_translation, self.speculative_translation
+        except Exception as e:
+            logger.error("Streaming translation failed: %s — falling back", e)
+            return self.translate(source_text, alt_hypotheses)
+
     def translate(
         self, source_text: str, alt_hypotheses: list[str] | None = None,
     ) -> tuple[str, str]:
@@ -156,7 +223,7 @@ class ContinuationTranslator:
         if not source_text.strip():
             return self.confirmed_translation, self.speculative_translation
 
-        lang_name = LANGUAGE_NAMES.get(
+        lang_name = LANGUAGE_MAP.get(
             self.source_lang, self.source_lang or "the source language"
         )
 
@@ -387,13 +454,6 @@ class ContinuationTranslator:
                 "CONFIRM forced: locked %d chars after %d unstable cycles",
                 len(self.confirmed_translation), self.force_confirm_after,
             )
-
-    def reset_context(self):
-        """Reset all translation state."""
-        self.confirmed_translation = ""
-        self.speculative_translation = ""
-        self._last_full_output = ""
-        self._recent_outputs.clear()
 
     def estimated_cost(self) -> float:
         inp_rate, out_rate = PRICING.get(self.model_tier, (1.0, 5.0))

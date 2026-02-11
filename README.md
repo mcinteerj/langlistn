@@ -58,12 +58,6 @@ Two-zone terminal (bold = confirmed, dim italic = speculative)
                ↓                          ↑       │
         Terminal display                  └───────┘
         bold = locked, dim italic = live tail
-
-  ┌─ OPTIONAL ──────────────────────────────────┐
-  │  DIARIZATION (parallel, --diarize)          │
-  │  Same audio → diart (pyannote on CPU)       │
-  │  → Speaker A/B/C labels in status bar       │
-  └─────────────────────────────────────────────┘
 ```
 
 Audio is captured per-app via ScreenCaptureKit. Non-speech audio (music, silence) is filtered by Silero VAD before reaching Whisper. Whisper transcribes in the source language using a growing buffer with LocalAgreement-2 — text is confirmed only when two consecutive runs agree. The full source transcript and confirmed English are sent to Claude, which produces an updated translation. Translation is confirmed by diffing consecutive LLM outputs — stable prefixes are locked and fed back as context.
@@ -140,19 +134,6 @@ langlistn --app "zoom.us" --source ko --translate-model opus    # best quality
 | `sonnet` | ~500ms | ~$1.00 | Important conversations |
 | `opus` | ~800ms | ~$5.00 | Maximum accuracy |
 
-### Speaker diarization
-
-Identify different speakers in the audio (requires extra install):
-
-```bash
-pip install langlistn[diarize]
-langlistn --app "zoom.us" --source ko --diarize
-```
-
-Uses [diart](https://github.com/juanmc2005/diart) (pyannote-based streaming diarization). Runs on CPU alongside Whisper on ANE/GPU — no resource conflict. Speakers are labelled A, B, C, etc. in the status bar.
-
-> **Note**: First run downloads pyannote models (~500MB). Requires accepting the [pyannote model license](https://huggingface.co/pyannote/segmentation-3.0) on HuggingFace.
-
 ### Transcribe only (no translation)
 
 ```bash
@@ -198,6 +179,28 @@ langlistn --list-apps       # Show capturable apps (must be running)
 langlistn --list-devices    # Show audio input devices
 ```
 
+### All flags
+
+| Flag | Description |
+|------|-------------|
+| `--app NAME` | Capture audio from named app |
+| `--mic` | Capture from microphone |
+| `--source CODE` | Source language hint (ko, ja, zh, etc.) |
+| `--translate-model TIER` | Claude model: haiku (default), sonnet, opus |
+| `--no-translate` | Transcribe only, skip translation |
+| `--model NAME` | Whisper model override (default: auto by RAM) |
+| `--device NAME` | Microphone device name |
+| `--plain` | Pipe-friendly output (no ANSI, confirmed only) |
+| `--log FILE` | Save confirmed text to file |
+| `--json` | JSON output for `--list-apps` / `--list-devices` |
+| `--debug-log FILE` | Write debug log to file |
+| `--max-context N` | Max context chars for LLM (default: 2000) |
+| `--silence-reset N` | Seconds of silence before context reset (default: 10) |
+| `--force-confirm N` | Force-lock translation after N unstable cycles (default: 3) |
+| `--list-apps` | Show capturable apps |
+| `--list-devices` | Show audio input devices |
+| `--version` | Show version |
+
 ## Architecture
 
 ### Key design decisions
@@ -211,7 +214,6 @@ langlistn --list-devices    # Show audio input devices
 - **Ring buffer comparison**: Compares current LLM output against the last 4 outputs, not just the previous one. If outputs 1 and 3 agree (even though 2 differed), confirmation still fires.
 - **Multi-hypothesis translation**: Recent whisper speculative outputs (which may differ across runs) are fed to Claude as alternatives, helping disambiguate homophones and boundary-ambiguous words.
 - **25s audio buffer**: Whisper always processes a 30s spectrogram internally (shorter audio is zero-padded). Keeping 25s in the buffer maximises context for CJK languages where word boundaries are ambiguous.
-- **Optional speaker diarization**: diart (pyannote-based) runs on CPU alongside Whisper on ANE/GPU. No resource contention on Apple Silicon.
 
 ### Project structure
 
@@ -224,7 +226,6 @@ langlistn/
 │   ├── streaming_asr.py      # LocalAgreement-2 engine (from whisper_streaming)
 │   ├── translate.py          # Continuation-based Bedrock Claude translation
 │   ├── display.py            # Two-zone terminal renderer
-│   ├── diarize.py            # Speaker diarization via diart (optional)
 │   ├── config.py             # Languages, constants, model selection
 │   ├── audio/
 │   │   ├── __init__.py       # App capture (ScreenCaptureKit)
@@ -243,7 +244,6 @@ langlistn/
 | **App not in `--list-apps`** | The app must be running and producing audio. |
 | **Slow first run** | Model download (~3GB for large-v2). Cached after first run. |
 | **Hallucination loops** | Built-in VAD + hallucination detection. Try adding `--source` hint. |
-| **Diarization not working** | Install with `pip install langlistn[diarize]`. Accept pyannote model license on HuggingFace. |
 | **Intel Mac** | Not supported. mlx-whisper requires Apple Silicon (M1+). |
 
 ## License

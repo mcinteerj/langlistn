@@ -126,6 +126,8 @@ class TerminalDisplay:
         self._permanent_content: list[str] = []  # content of each permanent line
         self._erasable_lines = 0      # lines in the erasable zone
         self._last_locked = ""
+        self._lock = __import__('threading').Lock()
+        self._stopped = False
 
     def _erase(self):
         if self.plain or self._erasable_lines == 0:
@@ -135,6 +137,12 @@ class TerminalDisplay:
         self._erasable_lines = 0
 
     def update(self, locked: str, speculative: str = "", status: str = ""):
+        with self._lock:
+            self._update_inner(locked, speculative, status)
+
+    def _update_inner(self, locked: str, speculative: str = "", status: str = ""):
+        if self._stopped:
+            return
         self._erase()
 
         if self.plain:
@@ -273,7 +281,9 @@ class TerminalDisplay:
 
     def finish(self, *, duration: float = 0, words: int = 0, sentences: int = 0,
                llm_calls: int = 0, cost: float = 0.0, has_content: bool = False):
-        self._erase()
+        with self._lock:
+            self._stopped = True
+            self._erase()
         if self.plain:
             return
         inner = min(36, self.width - 6)  # content width inside box

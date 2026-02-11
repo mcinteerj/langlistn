@@ -12,7 +12,6 @@ agreement logic + segment-based buffer trimming.
 """
 
 import logging
-import sys
 
 import numpy as np
 
