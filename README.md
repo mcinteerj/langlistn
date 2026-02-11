@@ -32,9 +32,10 @@ flowchart TD
 ```bash
 git clone https://github.com/mcinteerj/langlistn.git
 cd langlistn
+python3 -m venv .venv
+.venv/bin/pip install .
+bash swift/build.sh
 ```
-
-First run automatically builds the Swift helper and creates a Python venv (~30s on first launch, instant after).
 
 ### 2. Configure Azure OpenAI
 
@@ -68,7 +69,14 @@ Your terminal app needs **two separate permissions** in System Settings → Priv
 ### 4. Run
 
 ```bash
-./langlistn --app "Google Chrome"
+.venv/bin/langlistn --app "Google Chrome"
+```
+
+Or activate the venv first:
+
+```bash
+source .venv/bin/activate
+langlistn --app "Google Chrome"
 ```
 
 ## Usage
@@ -77,12 +85,12 @@ Your terminal app needs **two separate permissions** in System Settings → Priv
 
 ```bash
 # Auto-detect language — just point at any app
-./langlistn --app "Google Chrome"
-./langlistn --app "zoom.us"
-./langlistn --app "Microsoft Teams"
-./langlistn --app "Spotify"
-./langlistn --app "Safari"
-./langlistn --app "Discord"
+langlistn --app "Google Chrome"
+langlistn --app "zoom.us"
+langlistn --app "Microsoft Teams"
+langlistn --app "Spotify"
+langlistn --app "Safari"
+langlistn --app "Discord"
 ```
 
 ### Source language hints
@@ -90,12 +98,12 @@ Your terminal app needs **two separate permissions** in System Settings → Priv
 Auto-detection works well, but hinting improves accuracy for specific languages:
 
 ```bash
-./langlistn --app "Google Chrome" --source ko     # Korean
-./langlistn --app "Google Chrome" --source ja     # Japanese
-./langlistn --app "zoom.us" --source zh           # Mandarin
-./langlistn --app "Microsoft Teams" --source fr   # French
-./langlistn --app "zoom.us" --source de           # German
-./langlistn --app "Google Chrome" --source es     # Spanish
+langlistn --app "Google Chrome" --source ko     # Korean
+langlistn --app "Google Chrome" --source ja     # Japanese
+langlistn --app "zoom.us" --source zh           # Mandarin
+langlistn --app "Microsoft Teams" --source fr   # French
+langlistn --app "zoom.us" --source de           # German
+langlistn --app "Google Chrome" --source es     # Spanish
 ```
 
 <details>
@@ -110,30 +118,30 @@ Auto-detects any language Whisper supports — these codes are hints, not requir
 
 ```bash
 # Default microphone
-./langlistn --mic
+langlistn --mic
 
 # Specific microphone
-./langlistn --mic --device "MacBook Pro Microphone"
+langlistn --mic --device "MacBook Pro Microphone"
 
 # Mic with language hint
-./langlistn --mic --source de
+langlistn --mic --source de
 ```
 
 ### Discovery
 
 ```bash
-./langlistn --list-apps       # Show capturable apps (must be running)
-./langlistn --list-devices    # Show audio input devices
+langlistn --list-apps       # Show capturable apps (must be running)
+langlistn --list-devices    # Show audio input devices
 ```
 
 ### Combining options
 
 ```bash
 # Full example: Korean source, show original text, log to file
-./langlistn --app "Google Chrome" --source ko --transcript --log meeting.txt
+langlistn --app "Google Chrome" --source ko --transcript --log meeting.txt
 
 # Use the full model for higher quality
-./langlistn --app "Google Chrome" --deployment gpt-realtime
+langlistn --app "Google Chrome" --deployment gpt-realtime
 ```
 
 ### TUI keybindings
@@ -159,7 +167,6 @@ Auto-detects any language Whisper supports — these codes are hints, not requir
 | **`OPENAI_API_BASE not set`** | Set your Azure endpoint URL in `.env` or environment. |
 | **`API key rejected`** | Verify key and endpoint in Azure OpenAI Studio. |
 | **Swift build fails** | Install Xcode Command Line Tools: `xcode-select --install` |
-| **First run seems stuck** | Swift compilation takes ~30s on first launch. Subsequent runs are instant. |
 | **App not in `--list-apps`** | The app must be running and producing audio. |
 | **Mic permission denied** | Grant microphone access to your terminal in System Settings → Privacy & Security → Microphone. |
 | **Reconnect loop** | Check API key, endpoint URL, and deployment name. Verify deployment is active. |
@@ -168,7 +175,6 @@ Auto-detects any language Whisper supports — these codes are hints, not requir
 
 ```
 langlistn/
-├── langlistn               # Shell wrapper (auto-builds venv + Swift)
 ├── pyproject.toml
 ├── .env.example
 ├── src/langlistn/
