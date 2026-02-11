@@ -47,11 +47,41 @@ def _seconds_to_bytes(seconds: float) -> int:
     return int(seconds * SAMPLE_RATE * BYTES_PER_SAMPLE)
 
 
+def _is_hallucination(text: str) -> bool:
+    """Detect Whisper hallucination loops (repeated phrases).
+
+    Whisper hallucinates by repeating short phrases endlessly, e.g.
+    "even if I do, even if I do, even if I do, ..."
+    """
+    words = text.split()
+    if len(words) < 8:
+        return False
+
+    # Check for short repeating patterns (1-6 word ngrams)
+    for ngram_size in range(1, 7):
+        if len(words) < ngram_size * 3:
+            continue
+        # Count occurrences of each ngram
+        ngrams: dict[tuple, int] = {}
+        for i in range(len(words) - ngram_size + 1):
+            gram = tuple(w.lower().strip(".,!?") for w in words[i:i + ngram_size])
+            ngrams[gram] = ngrams.get(gram, 0) + 1
+
+        # If any ngram appears in >40% of possible positions, it's a loop
+        max_count = max(ngrams.values())
+        possible = len(words) - ngram_size + 1
+        if max_count >= max(4, possible * 0.4):
+            logger.debug("Hallucination detected: ngram=%d max_count=%d/%d",
+                         ngram_size, max_count, possible)
+            return True
+
+    return False
+
+
 def _diff_suffix(previous: str, current: str) -> str:
     """Find the new text in `current` that wasn't in `previous`.
 
-    Uses SequenceMatcher to find the longest common prefix/overlap,
-    then returns the remainder.
+    Uses word-level tail matching to find the overlap point.
     """
     if not previous:
         return current
@@ -62,15 +92,13 @@ def _diff_suffix(previous: str, current: str) -> str:
     if current.startswith(previous):
         return current[len(previous):].lstrip()
 
-    # Use SequenceMatcher to find where new content begins
     prev_words = previous.split()
     curr_words = current.split()
 
-    matcher = SequenceMatcher(None, prev_words, curr_words)
-    # Find the longest matching block anchored at the end of prev / start of curr
-    # We want to find how much of prev's tail matches curr's head
+    # Find longest suffix of prev that matches a prefix of curr
     best_overlap = 0
-    for size in range(min(len(prev_words), len(curr_words)), 0, -1):
+    max_check = min(len(prev_words), len(curr_words))
+    for size in range(max_check, 0, -1):
         if prev_words[-size:] == curr_words[:size]:
             best_overlap = size
             break
@@ -78,7 +106,11 @@ def _diff_suffix(previous: str, current: str) -> str:
     if best_overlap > 0:
         new_words = curr_words[best_overlap:]
     else:
-        # No overlap found — just return current (may cause some repetition)
+        # No overlap — check if curr is entirely contained in prev (duplicate window)
+        curr_str = " ".join(curr_words).lower()
+        prev_str = " ".join(prev_words).lower()
+        if curr_str in prev_str:
+            return ""
         new_words = curr_words
 
     return " ".join(new_words)
@@ -280,6 +312,13 @@ class LocalWhisperSession:
                 await asyncio.sleep(STEP_SECONDS)
                 continue
 
+            # Drop hallucinated repetition loops
+            if _is_hallucination(text):
+                logger.info("Dropped hallucination: %r", text[:80])
+                await self._emit(EventKind.STATUS, self.stats.status_line())
+                await asyncio.sleep(STEP_SECONDS)
+                continue
+
             # Diff against previous to find new content
             new_text = _diff_suffix(self._previous_text, text)
 
@@ -318,10 +357,26 @@ class LocalWhisperSession:
             task=self.task,
             language=self.lang,
             fp16=True,
-            no_speech_threshold=0.6,
-            condition_on_previous_text=True,
-            word_timestamps=True,
+            no_speech_threshold=0.5,
+            # IMPORTANT: disable condition_on_previous_text to prevent
+            # hallucination snowballing across windows
+            condition_on_previous_text=False,
+            compression_ratio_threshold=2.4,  # default, catches repetitive outputs
+            logprob_threshold=-1.0,
         )
+
+        # Post-filter: drop segments with high no_speech_prob
+        segments = result.get("segments", [])
+        filtered = []
+        for seg in segments:
+            if seg.get("no_speech_prob", 0) > 0.5:
+                logger.debug("Dropping no-speech segment: %r", seg.get("text", "")[:50])
+                continue
+            filtered.append(seg)
+
+        # Rebuild text from filtered segments
+        result["text"] = " ".join(s.get("text", "").strip() for s in filtered).strip()
+        result["segments"] = filtered
         return result
 
     async def commit_watchdog(self) -> None:

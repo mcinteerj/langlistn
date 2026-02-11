@@ -148,6 +148,8 @@ class AppCapture:
                 await self._stderr_task
             except asyncio.CancelledError:
                 pass
+        if not self._proc:
+            return 0, ""
         rc = self._proc.returncode or 0
         stderr = self._last_stderr
         self._proc = None
