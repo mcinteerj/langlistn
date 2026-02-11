@@ -134,17 +134,22 @@ async def run_cli(
 
     # --- Timestamp-based confirmed/speculative tracking ---
     #
-    # Each window is WINDOW_SECONDS long. The overlap with the previous
-    # window is (WINDOW - STEP) seconds. Segments whose timestamps fall
-    # entirely within the overlap region have been "seen twice" and are
-    # confirmed. Segments in the new region (last STEP seconds) are
-    # speculative and may change next window.
+    # With 20s window and 5s step, each window slides 5s forward.
+    # Whisper gives relative timestamps (0-20s within each window).
     #
-    # We track the absolute audio time to know which segments are new.
+    # In relative time, the overlap region is [0, 15s] — audio that
+    # also existed in the previous window. The new audio is [15s, 20s].
+    #
+    # But [0, 10s] was already confirmed by previous windows. So:
+    #   [0, overlap-step]       = already confirmed → SKIP
+    #   [overlap-step, overlap] = was speculative, now confirmed → CONFIRM  
+    #   [overlap, 20s]          = brand new → SPECULATIVE
+    #
+    # In our config: skip < 10s, confirm 10-15s, speculate 15-20s.
 
-    overlap_seconds = WINDOW_SECONDS - STEP_SECONDS  # 15s with 20/5 config
+    overlap_seconds = WINDOW_SECONDS - STEP_SECONDS  # 15s
+    confirm_start = overlap_seconds - STEP_SECONDS     # 10s — newly confirmed zone starts here
     windows_processed = 0
-    last_confirmed_end_ts = 0.0  # absolute timestamp of last confirmed segment end
 
     async def audio_loop():
         while not shutdown.is_set():
@@ -154,7 +159,7 @@ async def run_cli(
             await session.send_audio(chunk)
 
     async def process_loop():
-        nonlocal windows_processed, last_confirmed_end_ts
+        nonlocal windows_processed
 
         step_bytes = _seconds_to_bytes(STEP_SECONDS)
         window_bytes = _seconds_to_bytes(WINDOW_SECONDS)
@@ -202,11 +207,14 @@ async def run_cli(
                 continue
 
             # --- Split segments into confirmed vs speculative by timestamp ---
-            # Segments ending before overlap_seconds are in the overlap region
-            # (they existed in the previous window too) = confirmed.
-            # Segments starting after overlap_seconds are new = speculative.
             #
-            # For the FIRST window, everything is speculative (nothing to confirm against).
+            # Window timeline (relative timestamps from Whisper):
+            #   [0 ......... prev_boundary ... overlap_seconds ... WINDOW_SECONDS]
+            #    ^-- already confirmed --^ ^-- newly confirmed --^ ^-- speculative
+            #
+            # First window: everything speculative (no prior window to confirm against).
+            # After that: segments between prev_boundary and overlap_seconds are the
+            # "new slice" that was speculative last window and is now confirmed.
 
             confirmed_parts: list[str] = []
             speculative_parts: list[str] = []
@@ -220,10 +228,15 @@ async def run_cli(
                     if not seg_text:
                         continue
                     seg_end = seg.get("end", 0)
-                    # Segment ends within overlap region → confirmed
-                    if seg_end <= overlap_seconds:
+
+                    if seg_end <= confirm_start:
+                        # [0, 10s] — already confirmed previously → skip
+                        continue
+                    elif seg_end <= overlap_seconds:
+                        # [10s, 15s] — was speculative, now confirmed
                         confirmed_parts.append(seg_text)
                     else:
+                        # [15s, 20s] — new audio → speculative
                         speculative_parts.append(seg_text)
 
             confirmed_text = " ".join(confirmed_parts)
