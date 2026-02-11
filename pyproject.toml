@@ -25,6 +25,8 @@ dependencies = [
     "sounddevice>=0.5",
     "textual>=3.0",
     "python-dotenv>=1.0",
+    "mlx-whisper>=0.4",
+    "numpy>=1.26",
 ]
 
 [tool.setuptools.packages.find]

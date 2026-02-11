@@ -1,4 +1,4 @@
-"""Main async orchestrator — ties audio, realtime API, and TUI together."""
+"""Main async orchestrator — ties audio, session (API or local), and TUI together."""
 
 from __future__ import annotations
 
@@ -6,7 +6,6 @@ import asyncio
 
 from .audio import AppCapture, AudioSource
 from .audio.mic_capture import MicCapture
-from .realtime import RealtimeSession
 from .tui import TranslateApp
 
 
@@ -18,6 +17,8 @@ async def run_app(
     deployment: str = "gpt-realtime-mini",
     log_path: str | None = None,
     show_transcript: bool = False,
+    local: bool = False,
+    model: str = "mlx-community/whisper-large-v3-turbo",
 ) -> None:
     from .config import resolve_language_name
 
@@ -34,8 +35,14 @@ async def run_app(
     else:
         raise ValueError("Must specify --app or --mic")
 
-    # Build Realtime session
-    session = RealtimeSession(lang=lang, deployment=deployment)
+    # Build session — local Whisper or OpenAI Realtime
+    if local:
+        from .whisper_local import LocalWhisperSession
+        session = LocalWhisperSession(lang=lang, model=model)
+        mode += " · local whisper"
+    else:
+        from .realtime import RealtimeSession
+        session = RealtimeSession(lang=lang, deployment=deployment)
 
     # Build TUI
     tui = TranslateApp(

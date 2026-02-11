@@ -60,6 +60,10 @@ environment variables:
     parser.add_argument("--log", metavar="FILE", help="Save translations to file")
     parser.add_argument("--deployment", metavar="NAME", default="gpt-realtime-mini",
                         help="Azure OpenAI deployment name (default: gpt-realtime-mini)")
+    parser.add_argument("--local", action="store_true",
+                        help="Use local Whisper instead of OpenAI Realtime API (free, offline)")
+    parser.add_argument("--model", metavar="NAME", default="mlx-community/whisper-large-v3-turbo",
+                        help="Whisper model for --local mode (default: mlx-community/whisper-large-v3-turbo)")
     parser.add_argument("--json", dest="output_json", action="store_true", help="JSON output (for --list-*)")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
 
@@ -102,6 +106,8 @@ environment variables:
                 deployment=args.deployment,
                 log_path=args.log,
                 show_transcript=args.transcript,
+                local=args.local,
+                model=args.model,
             )
         )
     except KeyboardInterrupt:
