@@ -6,7 +6,7 @@ Local Whisper transcription + cloud translation via AWS Bedrock Claude for natur
 
 > **macOS 15+** · **Apple Silicon (M1+)** · **Python 3.11+** · **AWS account** (for translation)
 
-## 30-second start
+## Quickstart
 
 ```bash
 git clone https://github.com/mcinteerj/langlistn.git
@@ -17,7 +17,19 @@ aws sso login                          # or however you auth to AWS
 langlistn                              # interactive setup walks you through it
 ```
 
-> First run downloads the Whisper model (~3GB). Grant your terminal **Screen & System Audio Recording** permissions in System Settings → Privacy & Security and restart it.
+The interactive wizard lets you pick an audio source (app or mic), source language, and translation model. Your last 5 configurations are saved — on next launch, just pick a recent config or start a new one.
+
+> **First run:** Downloads the Whisper model (~3 GB). Grant your terminal **Screen Recording** and **System Audio Recording** permissions in System Settings → Privacy & Security, then restart your terminal.
+
+### AWS setup
+
+Translation uses [AWS Bedrock](https://aws.amazon.com/bedrock/) with cross-region inference (no specific region required). You need:
+
+1. An AWS account with valid credentials (`aws configure` / SSO / env vars)
+2. **Bedrock model access** enabled for Anthropic Claude models — go to [AWS Console → Bedrock → Model access](https://console.aws.amazon.com/bedrock/home#/modelaccess) and request access to the Claude models you want to use
+3. IAM permissions: `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream` on `arn:aws:bedrock:*::foundation-model/anthropic.claude-*`
+
+> Currently AWS Bedrock is the only supported translation provider. Other providers (e.g. direct Anthropic API, local models) could be added in future if there's interest — open an issue.
 
 ## How it works
 
@@ -75,29 +87,9 @@ Two-zone terminal (bold = confirmed, dim italic = speculative)
 
 Audio is captured per-app via ScreenCaptureKit. Non-speech audio (music, silence) is filtered by Silero VAD before reaching Whisper. Whisper transcribes in the source language using a growing buffer with LocalAgreement-2 — text is confirmed only when two consecutive runs agree. Transcription and translation run as parallel async loops — whisper updates the display immediately, while Claude translates independently using the latest source text. Translation is confirmed by diffing consecutive LLM outputs — stable prefixes are locked and fed back as context. Streaming LLM responses provide incremental display updates as tokens arrive.
 
-## Install
-
-```bash
-git clone https://github.com/mcinteerj/langlistn.git
-cd langlistn
-python3 -m venv .venv
-.venv/bin/pip install .
-bash swift/build.sh
-```
-
-Grant your terminal **Screen & System Audio Recording** permissions in System Settings → Privacy & Security. Restart your terminal after.
-
-### AWS setup
-
-Translation requires AWS credentials with Bedrock access:
-
-```bash
-aws sso login    # or configure credentials however you prefer
-```
-
-Your AWS profile needs access to Bedrock Claude models in your configured region. First run downloads the Whisper model (~3GB).
-
 ## Usage
+
+The simplest way to use langlistn is the interactive wizard — just run `langlistn` with no arguments. The sections below cover CLI flags for scripting, automation, and power-user control.
 
 ### App audio
 
@@ -134,6 +126,8 @@ langlistn --app "zoom.us" --source ko --translate-model opus    # best quality
 | `haiku` | ~300ms | ~$0.30 | Meetings, casual use |
 | `sonnet` | ~500ms | ~$1.00 | Important conversations |
 | `opus` | ~800ms | ~$5.00 | Maximum accuracy |
+
+> Cost estimates as of early 2026. See [AWS Bedrock pricing](https://aws.amazon.com/bedrock/pricing/) for current rates.
 
 ### Transcribe only (no translation)
 
@@ -241,9 +235,9 @@ langlistn/
 |---------|-----|
 | **No audio / silence** | Grant both Screen Recording AND System Audio Recording permissions. Restart terminal. |
 | **Swift build fails** | Install Xcode Command Line Tools: `xcode-select --install` |
-| **Translation errors** | Check AWS auth: `aws sts get-caller-identity`. Ensure Bedrock Claude access. |
+| **Translation errors** | Check AWS auth: `aws sts get-caller-identity`. Ensure Bedrock Claude model access is enabled. |
 | **App not in `--list-apps`** | The app must be running and producing audio. |
-| **Slow first run** | Model download (~3GB for large-v2). Cached after first run. |
+| **Slow first run** | Model download (~3 GB for large-v2). Cached after first run. |
 | **Hallucination loops** | Built-in VAD + hallucination detection. Try adding `--source` hint. |
 | **Intel Mac** | Not supported. mlx-whisper requires Apple Silicon (M1+). |
 
