@@ -166,20 +166,19 @@ class TerminalDisplay:
         ERASABLE_LOCKED_BUFFER = 3  # keep last N locked lines erasable
         new_permanent_target = max(0, total_locked - ERASABLE_LOCKED_BUFFER)
 
-        # Only advance if new lines match what we'd print
-        # (prevents committing lines that might re-wrap differently next update)
+        # Only advance permanent lines if locked text actually grew.
+        # This prevents re-committing the same lines when different callers
+        # (whisper_loop vs translate_loop) pass slightly different locked text.
         safe_target = self._permanent_lines
-        for i in range(self._permanent_lines, new_permanent_target):
-            # Check this line matches what was in the erasable zone last frame
-            if i < len(self._permanent_content) and \
-               self._permanent_content[i] == locked_lines[i]:
-                safe_target = i + 1
-            elif i >= len(self._permanent_content):
-                # New line not seen before — commit it and record
-                safe_target = i + 1
-            else:
-                # Content changed — stop advancing
-                break
+        if total_locked > len(self._permanent_content):
+            for i in range(self._permanent_lines, new_permanent_target):
+                if i < len(self._permanent_content) and \
+                   self._permanent_content[i] == locked_lines[i]:
+                    safe_target = i + 1
+                elif i >= len(self._permanent_content):
+                    safe_target = i + 1
+                else:
+                    break
 
         for i in range(self._permanent_lines, safe_target):
             sys.stdout.write(f"{BOLD}{locked_lines[i]}{RESET}\n")

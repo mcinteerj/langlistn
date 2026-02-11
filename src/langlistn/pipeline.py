@@ -524,18 +524,22 @@ async def run_pipeline(
                 if h != state.speculative_source
             ][-2:]
 
+            # Snapshot confirmed text BEFORE streaming starts — this stays
+            # constant throughout the stream so the display doesn't see
+            # the locked zone jump when _update_confirmation runs at the end.
+            confirmed_snapshot = translator.confirmed_translation
+
             # Streaming callback for live display updates
             def on_token(partial_translation: str):
-                confirmed_t = translator.confirmed_translation
                 # The LLM outputs the FULL translation from scratch each time.
                 # While it's still reproducing the already-confirmed prefix,
                 # don't show anything speculative (it would duplicate).
                 # Only show the new tail once it extends past confirmed text.
-                if len(partial_translation) <= len(confirmed_t):
+                if len(partial_translation) <= len(confirmed_snapshot):
                     return  # still reproducing confirmed prefix — no update
-                spec_part = partial_translation[len(confirmed_t):].strip()
+                spec_part = partial_translation[len(confirmed_snapshot):].strip()
                 if spec_part:
-                    display.update(confirmed_t, spec_part, _build_status())
+                    display.update(confirmed_snapshot, spec_part, _build_status())
 
             state.streaming_active = True
             try:
