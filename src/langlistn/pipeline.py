@@ -505,10 +505,18 @@ async def run_pipeline(
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for t in pending:
             t.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
+        # Short timeout — don't block exit waiting for audio subprocess
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*pending, return_exceptions=True), timeout=1.0
+            )
+        except asyncio.TimeoutError:
+            pass
     except asyncio.CancelledError:
         pass
     finally:
+        # Kill audio source immediately to avoid lingering subprocess
+        await source.stop()
         # Flush remaining speculative
         _, _, remaining = processor.finish()
         if remaining and not _is_hallucination(remaining):
@@ -517,13 +525,19 @@ async def run_pipeline(
         full_final = ""
         all_source = (confirmed_display + " " + confirmed_source).strip()
         if translator and all_source:
-            try:
-                locked, spec = translator.translate(all_source)
-                full_final = (locked + " " + spec).strip()
+            # Use existing translation if available, skip final LLM call
+            existing = (translator.confirmed_translation + " " + translator.speculative_translation).strip()
+            if existing:
+                full_final = existing
                 display.update(full_final, "")
-            except Exception:
-                full_final = translator.confirmed_translation or all_source
-                display.update(full_final, "")
+            else:
+                try:
+                    locked, spec = translator.translate(all_source)
+                    full_final = (locked + " " + spec).strip()
+                    display.update(full_final, "")
+                except Exception:
+                    full_final = all_source
+                    display.update(all_source, "")
         elif all_source:
             full_final = all_source
             display.update(all_source, "")
@@ -544,6 +558,5 @@ async def run_pipeline(
         if all_source and not plain and final_text.strip():
             _offer_transcript_save(final_text, start_time)
 
-        await source.stop()
         if log_file:
             log_file.close()
