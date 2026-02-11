@@ -15,7 +15,10 @@ import argparse
 import asyncio
 import json
 import logging
+import select
 import sys
+import termios
+import tty
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -39,6 +42,42 @@ def _save_last_session(data: dict):
         _LAST_SESSION.write_text(json.dumps(data))
     except Exception:
         pass
+
+
+def _quick_rerun_prompt(last: dict) -> bool | None:
+    """Show last-session prompt. Returns True=reuse, False=wizard, None=no last."""
+    app = last.get("app")
+    mic = last.get("mic")
+    if not app and not mic:
+        return None
+    source = app or "microphone"
+    lang = last.get("lang") or "auto"
+    t_model = last.get("translate_model") or "transcribe-only"
+    label = f"{source} / {lang} / {t_model}"
+
+    sys.stdout.write(f"\n  Last: {label}\n")
+    sys.stdout.write("  Enter to reuse, any key for setup: ")
+    sys.stdout.flush()
+
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ready, _, _ = select.select([fd], [], [], 10.0)
+        if ready:
+            ch = sys.stdin.read(1)
+            sys.stdout.write("\n")
+            if ch in ("\r", "\n"):
+                return True
+            if ch == "\x03":  # Ctrl+C
+                raise KeyboardInterrupt
+            return False
+        else:
+            # Timeout — reuse
+            sys.stdout.write("\n")
+            return True
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
 def _pick(prompt: str, options: list[str], default: int = 0) -> str:
@@ -199,6 +238,8 @@ def _interactive_setup() -> dict:
     # Remember for next time
     _save_last_session({
         "app": app_name,
+        "mic": mic,
+        "device": device,
         "lang": lang,
         "translate_model": translate_model,
     })
@@ -279,7 +320,22 @@ examples:
     # Interactive mode if no source specified
     if not args.app and not args.mic:
         try:
-            kwargs = _interactive_setup()
+            last = _load_last_session()
+            if last.get("app") or last.get("mic"):
+                reuse = _quick_rerun_prompt(last)
+                if reuse:
+                    kwargs = {
+                        "app_name": last.get("app"),
+                        "mic": last.get("mic", False),
+                        "device": last.get("device"),
+                        "lang": last.get("lang"),
+                        "translate_model": last.get("translate_model"),
+                        "no_translate": last.get("translate_model") is None,
+                    }
+                else:
+                    kwargs = _interactive_setup()
+            else:
+                kwargs = _interactive_setup()
         except KeyboardInterrupt:
             print("\n")
             return

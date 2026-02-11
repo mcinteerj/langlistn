@@ -163,18 +163,53 @@ class TerminalDisplay:
     def print_header(self, mode: str, lang: str | None, model: str, translate_model: str | None = None):
         if self.plain:
             return
-        lang_display = f"{lang} → English" if lang else "auto-detect → English"
-        sep = "─" * self.width
+        w = self.width
+        lang_display = f"{lang} → English" if lang else "auto → English"
         model_short = model.split("/")[-1] if "/" in model else model
-        t_info = f" + Claude {translate_model}" if translate_model else ""
-        sys.stdout.write(
-            f"\n{BOLD}langlistn{RESET} — {lang_display} — {mode} — {model_short}{t_info}\n"
-        )
-        sys.stdout.write(f"{DIM}{sep}{RESET}\n\n")
+        t_tag = f" · {translate_model}" if translate_model else ""
+        info = f"{lang_display} · {mode} · {model_short}{t_tag}"
+        hint = "Ctrl+C to stop"
+
+        # Top border
+        title = " langlistn "
+        pad = w - len(title) - 3
+        sys.stdout.write(f"\n {DIM}┌{RESET}{BOLD}{title}{RESET}{DIM}{'─' * max(pad, 0)}┐{RESET}\n")
+        # Info line
+        inner_w = w - 4
+        if w >= 50:
+            info_space = inner_w - len(hint) - 2
+            info_trimmed = info[:info_space].ljust(info_space)
+            sys.stdout.write(f" {DIM}│{RESET} {info_trimmed}{DIM}{hint}{RESET} {DIM}│{RESET}\n")
+        else:
+            sys.stdout.write(f" {DIM}│{RESET} {info[:inner_w].ljust(inner_w)} {DIM}│{RESET}\n")
+        # Bottom border
+        sys.stdout.write(f" {DIM}└{'─' * (w - 3)}┘{RESET}\n\n")
         sys.stdout.flush()
 
-    def finish(self, cost: float = 0.0):
+    def finish(self, *, duration: float = 0, words: int = 0, sentences: int = 0,
+               llm_calls: int = 0, cost: float = 0.0, has_content: bool = False):
         self._erase()
-        if not self.plain:
-            sys.stdout.write(f"\n{DIM}done. · ${cost:.3f}{RESET}\n\n")
-            sys.stdout.flush()
+        if self.plain:
+            return
+        w = min(40, self.width - 2)
+        inner = w - 4  # space between "│  " and "  │"
+
+        def _row(label: str, value: str) -> str:
+            content = f"{label}{value}"
+            return f" {DIM}│{RESET}  {content}{' ' * max(0, inner - len(content))}  {DIM}│{RESET}\n"
+
+        mins, secs = int(duration) // 60, int(duration) % 60
+        dur_str = f"{mins}:{secs:02d}"
+        cost_str = f"${cost:.3f}" if cost > 0 else ""
+        calls_val = f"{llm_calls} · {cost_str}" if cost_str else str(llm_calls)
+
+        sys.stdout.write(f"\n {DIM}╭─{RESET}{BOLD} session summary {RESET}{DIM}{'─' * max(0, w - 20)}╮{RESET}\n")
+        sys.stdout.write(_row("Duration     ", dur_str))
+        if words:
+            sys.stdout.write(_row("Words        ", str(words)))
+        if sentences:
+            sys.stdout.write(_row("Sentences    ", str(sentences)))
+        if llm_calls:
+            sys.stdout.write(_row("LLM calls    ", calls_val))
+        sys.stdout.write(f" {DIM}╰{'─' * (w - 2)}╯{RESET}\n\n")
+        sys.stdout.flush()

@@ -23,6 +23,7 @@ import threading
 import time
 from collections import Counter
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -134,6 +135,19 @@ def _looks_english(text: str) -> bool:
     if all_letters == 0:
         return True
     return (ascii_letters / all_letters) > 0.8
+
+
+def _offer_transcript_save(text: str, start_time: float):
+    """Prompt user to save transcript to Desktop."""
+    try:
+        ans = input("Save transcript? [Y/n] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return
+    if ans in ("", "y", "yes"):
+        ts = time.strftime("%Y%m%d-%H%M%S", time.localtime(start_time))
+        path = Path.home() / "Desktop" / f"langlistn-{ts}.txt"
+        path.write_text(text, encoding="utf-8")
+        print(f"  Saved → {path}")
 
 
 async def run_pipeline(
@@ -473,18 +487,35 @@ async def run_pipeline(
         if remaining and not _is_hallucination(remaining):
             confirmed_source += (" " + remaining if confirmed_source else remaining)
 
+        full_final = ""
         if translator and confirmed_source.strip() and not _looks_english(confirmed_source):
             try:
                 locked, spec = translator.translate(confirmed_source)
                 full_final = (locked + " " + spec).strip()
                 display.update(full_final, "")
             except Exception:
+                full_final = confirmed_source
                 display.update(confirmed_source, "")
         elif confirmed_source.strip():
+            full_final = confirmed_source
             display.update(confirmed_source, "")
 
+        duration = time.time() - start_time
         cost = translator.estimated_cost() if translator else 0.0
-        display.finish(cost)
+        final_text = full_final or confirmed_source
+        word_count = len(final_text.split()) if final_text.strip() else 0
+        sentence_count = sum(final_text.count(p) for p in '.!?。！？') if final_text.strip() else 0
+        llm_calls = translator.calls if translator else 0
+        display.finish(
+            duration=duration, words=word_count, sentences=sentence_count,
+            llm_calls=llm_calls, cost=cost,
+            has_content=bool(confirmed_source.strip()),
+        )
+
+        # Offer transcript save
+        if confirmed_source.strip() and not plain and final_text.strip():
+            _offer_transcript_save(final_text, start_time)
+
         await source.stop()
         if log_file:
             log_file.close()
