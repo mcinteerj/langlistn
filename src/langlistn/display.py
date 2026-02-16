@@ -136,11 +136,11 @@ class TerminalDisplay:
             sys.stdout.write(f"{MOVE_UP}{CLEAR_LINE}\r")
         self._erasable_lines = 0
 
-    def update(self, locked: str, speculative: str = "", status: str = ""):
+    def update(self, locked: str, speculative: str = "", status: str = "", force_commit: bool = False):
         with self._lock:
-            self._update_inner(locked, speculative, status)
+            self._update_inner(locked, speculative, status, force_commit)
 
-    def _update_inner(self, locked: str, speculative: str = "", status: str = ""):
+    def _update_inner(self, locked: str, speculative: str = "", status: str = "", force_commit: bool = False):
         if self._stopped:
             return
         self._erase()
@@ -163,7 +163,7 @@ class TerminalDisplay:
         # changes when the LLM revises text. Only commit lines whose content
         # matches what we previously rendered — this prevents duplicates when
         # re-wrapping shifts line boundaries.
-        ERASABLE_LOCKED_BUFFER = 3  # keep last N locked lines erasable
+        ERASABLE_LOCKED_BUFFER = 0 if force_commit else 3  # keep last N locked lines erasable
         new_permanent_target = max(0, total_locked - ERASABLE_LOCKED_BUFFER)
 
         # Only advance permanent lines if locked text actually grew.
@@ -281,6 +281,9 @@ class TerminalDisplay:
     def finish(self, *, duration: float = 0, words: int = 0, sentences: int = 0,
                llm_calls: int = 0, cost: float = 0.0, has_content: bool = False):
         with self._lock:
+            # Commit any remaining buffered lines before shutting down
+            if self._last_locked:
+                self._update_inner(self._last_locked, "", "", force_commit=True)
             self._stopped = True
             self._erase()
         if self.plain:
