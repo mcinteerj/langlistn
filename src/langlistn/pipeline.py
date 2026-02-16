@@ -134,9 +134,15 @@ def _read_single_key() -> str:
 
 def _offer_transcript_save(text: str, start_time: float):
     """Prompt user to save transcript to Desktop."""
+    import termios
     try:
         sys.stdout.write("Save transcript? [Y/n] ")
         sys.stdout.flush()
+        
+        # Flush any buffered input (e.g. from Ctrl+C or typing during session)
+        fd = sys.stdin.fileno()
+        termios.tcflush(fd, termios.TCIFLUSH)
+        
         ch = _read_single_key().lower()
         sys.stdout.write(ch + "\n")
     except (EOFError, KeyboardInterrupt, OSError):
