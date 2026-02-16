@@ -12,6 +12,7 @@ Local Whisper transcription + cloud translation via AWS Bedrock Claude for natur
 git clone https://github.com/mcinteerj/langlistn.git
 cd langlistn
 python3 -m venv .venv && .venv/bin/pip install .
+source .venv/bin/activate
 bash swift/build.sh
 aws sso login                          # or however you auth to AWS
 langlistn                              # interactive setup walks you through it
